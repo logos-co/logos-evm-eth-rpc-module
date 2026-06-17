@@ -1,0 +1,166 @@
+name: "Running the eth-rpc Module Against logoscore"
+output: eth-rpc-module-runtime.md
+release: ""
+
+intro: |
+  `logos-evm-eth-rpc-module` is the **proxyable, fail-closed Ethereum JSON-RPC
+  client** for the Logos multi-chain EVM wallet. It stores configuration per
+  chain (endpoint + proxy policy) so callers route by `chainId` alone, and every
+  outbound request is built through a single fail-closed chokepoint: a chain
+  configured with `proxyRequired` and no usable proxy **refuses to send** rather
+  than leaking in the clear.
+
+  This doc-test drives the module through a `logoscore` daemon against a **local
+  mock JSON-RPC node** (so it needs no external network and reproduces in CI):
+
+  1. Build/install the module and start a daemon.
+  2. Configure a chain pointing at the mock node and read a balance — a real
+     round-trip through the module's RPC transport.
+  3. Configure a second chain that **requires a proxy** but has none, and watch
+     the module refuse the request (the privacy guarantee).
+
+what_you_build: "This `eth_rpc_module`, packaged as `.lgx`, installed with `lgpm`, and driven through a `logoscore` daemon against a local mock node."
+
+what_you_learn:
+  - How per-chain config is stored in the module and addressed by chainId
+  - How a JSON-RPC round-trip flows through the module's transport
+  - How the fail-closed proxy chokepoint refuses to send when a proxy is required but unavailable
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled. Install from [nixos.org](https://nixos.org/download.html), then enable flakes:
+
+    ```bash
+    mkdir -p ~/.config/nix
+    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
+    ```
+  - "**A Linux or macOS machine** with `python3` available (used to run the local mock JSON-RPC node)."
+
+sections:
+  - title: "Build logoscore and lgpm"
+    step: true
+    steps:
+      - title: "Build logoscore"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        check_file: "logos/bin/logoscore"
+      - title: "Build lgpm"
+        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
+        check_file: "lgpm/bin/lgpm"
+
+  - title: "Build and install the eth-rpc module"
+    step: true
+    steps:
+      - title: "Build the module's .lgx"
+        run: "nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx' --no-write-lock-file -o eth-rpc-lgx"
+        code_block: |
+          nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx' -o eth-rpc-lgx
+        extra_run:
+          run: "ls eth-rpc-lgx/*.lgx"
+      - title: "Seed the capability module"
+        run: |
+          mkdir -p modules
+          cp -RL ./logos/modules/. ./modules/
+        check_file: "modules/capability_module/manifest.json"
+      - title: "Install the .lgx with lgpm"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file eth-rpc-lgx/*.lgx"
+        expect_contains:
+          - "Installed to:"
+      - title: "Confirm the install"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules list"
+        expect_contains:
+          - "eth_rpc_module"
+
+  - title: "Start a mock JSON-RPC node"
+    step: true
+    text: |
+      A tiny local node that answers a few JSON-RPC methods with canned values, so
+      the round-trip is deterministic and offline.
+    steps:
+      - title: "Write the mock node"
+        file:
+          path: mock_node.py
+          content: |
+            import http.server, json
+            RES = {"eth_chainId": "0x1", "eth_getBalance": "0x1234", "eth_blockNumber": "0x10"}
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    n = int(self.headers.get('content-length', 0))
+                    req = json.loads(self.rfile.read(n) or b'{}')
+                    body = json.dumps({"jsonrpc": "2.0", "id": req.get("id", 1),
+                                       "result": RES.get(req.get("method"), "0x0")}).encode()
+                    self.send_response(200)
+                    self.send_header('content-length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('127.0.0.1', 8599), H).serve_forever()
+      - title: "Start the mock node"
+        run: "sh -c 'python3 mock_node.py > mock.log 2>&1 &'"
+        code_block: "python3 mock_node.py &"
+      - run: "sleep 2"
+
+  - title: "Run the daemon and drive the client"
+    step: true
+    steps:
+      - title: "Write the chain configs"
+        text: |
+          Two chains: chain 1 points at the mock node with no proxy required;
+          chain 9 **requires** a proxy but is given none — so it must fail closed.
+        file:
+          path: chain_ok.json
+          content: |
+            { "endpoint": "http://127.0.0.1:8599", "proxyRequired": false }
+      - title: "Write the fail-closed chain config"
+        file:
+          path: chain_fc.json
+          content: |
+            { "endpoint": "http://127.0.0.1:8599", "proxyRequired": true }
+      - title: "Start the daemon"
+        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
+        code_block: "logoscore -D -m ./modules > logs.txt &"
+      - run: "sleep 3"
+      - title: "Load the module"
+        run: "./logos/bin/logoscore load-module eth_rpc_module"
+        expect_contains:
+          - "eth_rpc_module"
+      - title: "Configure chain 1 (mock node, no proxy)"
+        run: "./logos/bin/logoscore call eth_rpc_module set_chain_config 1 @chain_ok.json"
+        code_block: "logoscore call eth_rpc_module set_chain_config 1 @chain_ok.json"
+        expect_contains:
+          - "true"
+      - title: "List configured chains"
+        run: "./logos/bin/logoscore call eth_rpc_module list_chains"
+        expect_contains:
+          - "chains"
+      - title: "Verify the chain ID (real RPC round-trip)"
+        text: "`verify_chain_id` issues a live `eth_chainId` to the mock node."
+        run: "./logos/bin/logoscore call eth_rpc_module verify_chain_id 1"
+        code_block: "logoscore call eth_rpc_module verify_chain_id 1"
+        expect_contains:
+          - "chainId"
+      - title: "Read a balance (round-trip)"
+        run: "./logos/bin/logoscore call eth_rpc_module get_balance 1 f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        code_block: "logoscore call eth_rpc_module get_balance 1 <address>"
+        expect_contains:
+          - "0x1234"
+      - title: "Configure chain 9 (proxy REQUIRED, none available)"
+        run: "./logos/bin/logoscore call eth_rpc_module set_chain_config 9 @chain_fc.json"
+        expect_contains:
+          - "true"
+      - title: "Fail-closed: the request is refused"
+        text: |
+          Chain 9 requires a proxy but none is configured, so the module refuses
+          to send the request in the clear — the wallet's privacy guarantee.
+        run: "./logos/bin/logoscore call eth_rpc_module get_balance 9 f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        code_block: "logoscore call eth_rpc_module get_balance 9 <address>"
+        expect_contains:
+          - "proxy required"
+      - title: "Stop the daemon and the mock node"
+        run: |
+          ./logos/bin/logoscore stop
+          pkill -f mock_node.py 2>/dev/null || true
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logoscore status || true"
+        expect_contains:
+          - '"status":"not_running"'
