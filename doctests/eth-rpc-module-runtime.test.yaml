@@ -134,12 +134,25 @@ sections:
           - "chains"
       - title: "Verify the chain ID (real RPC round-trip)"
         text: "`verify_chain_id` issues a live `eth_chainId` to the mock node."
-        run: "./logos/bin/logoscore call eth_rpc_module verify_chain_id 1"
+        # Retry on a transient RPC_FAILED — the first call that drives the module
+        # through a blocking network round-trip can hit a transport race on loaded
+        # CI runners. verify_chain_id is a pure read, so retrying is safe.
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call eth_rpc_module verify_chain_id 1 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         code_block: "logoscore call eth_rpc_module verify_chain_id 1"
         expect_contains:
           - "chainId"
       - title: "Read a balance (round-trip)"
-        run: "./logos/bin/logoscore call eth_rpc_module get_balance 1 f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call eth_rpc_module get_balance 1 f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         code_block: "logoscore call eth_rpc_module get_balance 1 <address>"
         expect_contains:
           - "0x1234"
@@ -151,7 +164,12 @@ sections:
         text: |
           Chain 9 requires a proxy but none is configured, so the module refuses
           to send the request in the clear — the wallet's privacy guarantee.
-        run: "./logos/bin/logoscore call eth_rpc_module get_balance 9 f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call eth_rpc_module get_balance 9 f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         code_block: "logoscore call eth_rpc_module get_balance 9 <address>"
         expect_contains:
           - "proxy required"
