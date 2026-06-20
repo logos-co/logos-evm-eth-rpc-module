@@ -41,7 +41,14 @@ sections:
     step: true
     steps:
       - title: "Build logoscore"
-        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        text: |
+          `eth_rpc_module` is `concurrency: "multi"`, so the daemon resolves its
+          deferred replies on the caller's behalf — it must be built against
+          logos-protocol ≥ 0.2. The `--override-input` pins its protocol (and
+          liblogos's) to the chain under test (master, where 0.2 lives).
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --override-input logos-protocol 'github:logos-co/logos-protocol{release}' --override-input logos-liblogos/logos-protocol 'github:logos-co/logos-protocol{release}' --out-link ./logos"
+        code_block: |
+          nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
         check_file: "logos/bin/logoscore"
       - title: "Build lgpm"
         run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
