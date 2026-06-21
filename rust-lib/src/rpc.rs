@@ -131,8 +131,29 @@ impl EthRpc {
     /// Issue a raw JSON-RPC call and return the `result` value (or an error).
     pub fn rpc_call(&self, chain_id: u64, method: &str, params: Value) -> Result<Value> {
         let (client, endpoint) = self.client_for(chain_id)?;
+        Self::post_rpc(&client, &endpoint, method, params)
+    }
+
+    /// Like [`Self::rpc_call`] but POSTs to an explicit `url` instead of the
+    /// chain's configured endpoint, while still using `chain_id`'s fail-closed
+    /// proxied client. For off-chain JSON-RPC services tied to a chain — e.g. an
+    /// ERC-4337 bundler (`eth_sendUserOperation`) — so they too go through
+    /// net-proxy (a private send must not leak the user's IP to the bundler).
+    pub fn rpc_call_url(&self, chain_id: u64, url: &str, method: &str, params: Value) -> Result<Value> {
+        // Build the client from the chain's proxy config; ignore its endpoint.
+        let (client, _endpoint) = self.client_for(chain_id)?;
+        Self::post_rpc(&client, url, method, params)
+    }
+
+    /// POST a JSON-RPC request to `url` with `client` and unwrap the `result`.
+    fn post_rpc(
+        client: &reqwest::blocking::Client,
+        url: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let resp = client.post(&endpoint).json(&body).send().map_err(|e| RpcError::Http(e.to_string()))?;
+        let resp = client.post(url).json(&body).send().map_err(|e| RpcError::Http(e.to_string()))?;
         let v: Value = resp.json().map_err(|e| RpcError::Http(e.to_string()))?;
         if let Some(err) = v.get("error") {
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
