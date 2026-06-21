@@ -46,6 +46,12 @@ pub trait EthRpcModule: Send + Sync + 'static {
     fn get_transaction_by_hash(&self, chain_id: i64, hash_hex: String) -> String;
     /// Escape hatch for any standard JSON-RPC method. `params_json` is a JSON array.
     fn raw_rpc(&self, chain_id: i64, method: String, params_json: String) -> String;
+    /// Like [`Self::raw_rpc`] but POSTs to an explicit `url` (not the chain's
+    /// configured endpoint), reusing `chain_id`'s fail-closed proxied client. For
+    /// off-chain JSON-RPC tied to a chain — e.g. an ERC-4337 bundler
+    /// (`eth_sendUserOperation`) — so it too goes through net-proxy. `params_json`
+    /// is a JSON array.
+    fn raw_rpc_url(&self, chain_id: i64, url: String, method: String, params_json: String) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
 }
@@ -217,6 +223,17 @@ impl EthRpcModule for EthRpcModuleImpl {
             Err(e) => return err(e),
         };
         self.with_rpc(|rpc| match rpc.rpc_call(chain_id as u64, &method, params) {
+            Ok(v) => ok_result(v),
+            Err(e) => err(e),
+        })
+    }
+
+    fn raw_rpc_url(&self, chain_id: i64, url: String, method: String, params_json: String) -> String {
+        let params = match parse_json(&params_json) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        self.with_rpc(|rpc| match rpc.rpc_call_url(chain_id as u64, &url, &method, params) {
             Ok(v) => ok_result(v),
             Err(e) => err(e),
         })
