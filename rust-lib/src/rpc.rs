@@ -15,7 +15,29 @@ use serde_json::{json, Value};
 use crate::proxy::{build_client, ProxyConfig};
 
 fn default_timeout() -> u64 {
-    30
+    // Well under the 20s Logos RPC deadline. At 30 a single dead endpoint outlived the
+    // protocol timeout, so the caller saw a transport failure rather than "this chain is
+    // unreachable" — and behind a single-dispatch coordinator it took every other call with it.
+    8
+}
+
+fn default_verified_timeout() -> u64 {
+    // The verified path is a second hop (us -> proxy -> its provider) and a light client may
+    // be walking headers, so it gets more room — still under the deadline.
+    15
+}
+
+/// How JSON-RPC for a chain should be routed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VerifiedProxyMode {
+    /// Talk to the configured endpoint directly.
+    #[default]
+    Off,
+    /// Route through the light-client proxy and REFUSE rather than fall back. There is no
+    /// `preferred` mode on purpose: quietly answering from an unverified source when the user
+    /// asked for verification is the failure this feature exists to prevent.
+    Required,
 }
 
 /// Per-chain configuration. `endpoint` is the JSON-RPC URL; `proxy` /
@@ -31,6 +53,29 @@ pub struct ChainConfig {
     pub proxy_required: bool,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Whether to route through the light-client verified proxy. Distinct from `proxy`
+    /// above, which is a NETWORK proxy (SOCKS5h/Tor) answering a different question: that one
+    /// hides who is asking, this one proves the answer.
+    #[serde(default)]
+    pub verified_proxy_mode: VerifiedProxyMode,
+    #[serde(default = "default_verified_timeout")]
+    pub verified_timeout_secs: u64,
+}
+
+impl ChainConfig {
+    /// `proxyRequired` together with verified routing is a contradiction we refuse rather
+    /// than silently resolve: the verified proxy makes its own outbound connections and knows
+    /// nothing about our SOCKS config, so honouring both is impossible and honouring either
+    /// silently breaks the guarantee the other was asked for.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.proxy_required && self.verified_proxy_mode == VerifiedProxyMode::Required {
+            return Err("proxyRequired and verifiedProxyMode=required cannot both be set: the \
+                        verified proxy makes its own connections and cannot honour a SOCKS \
+                        proxy configured here"
+                .into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -40,6 +85,9 @@ pub enum RpcError {
     Http(String),
     Rpc { code: i64, message: String },
     Parse(String),
+    /// The verified path could not answer. NEVER downgraded to a direct call: a caller who
+    /// asked for verification gets an error, not an unverified number.
+    VerifiedProxy(String),
 }
 
 impl std::fmt::Display for RpcError {
@@ -49,6 +97,7 @@ impl std::fmt::Display for RpcError {
             RpcError::Proxy(e) => write!(f, "proxy: {e}"),
             RpcError::Http(e) => write!(f, "http: {e}"),
             RpcError::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
+            RpcError::VerifiedProxy(e) => write!(f, "verified proxy: {e}"),
             RpcError::Parse(e) => write!(f, "parse: {e}"),
         }
     }
@@ -56,15 +105,86 @@ impl std::fmt::Display for RpcError {
 
 type Result<T> = std::result::Result<T, RpcError>;
 
+/// What the verified proxy can actually say about an answer.
+///
+/// A light client proves state against a header's stateRoot. It cannot prove a fee oracle's
+/// opinion or that a broadcast was accepted — those are forwarded to its own execution
+/// provider and come back on trust. Badging them "verified" would be a false claim on exactly
+/// the numbers that decide what a transaction costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifiedClass {
+    Verified,
+    Proxied,
+}
+
+pub fn verified_class(method: &str) -> VerifiedClass {
+    match method {
+        "eth_getBalance" | "eth_getTransactionCount" | "eth_getCode" | "eth_getStorageAt"
+        | "eth_call" => VerifiedClass::Verified,
+        _ => VerifiedClass::Proxied,
+    }
+}
+
+/// Rewrite params for the verified leg ONLY.
+///
+/// What eth_rpc sends to real nodes must not change: `eth_feeHistory`'s blockCount is a hex
+/// QUANTITY string per ethereum/execution-apis, and the proxy declaring it `u64` is the
+/// non-conformant side. Coercing at the source would make a shared module violate the spec to
+/// suit one consumer, and be wrong against any strict node. So the translation lives here,
+/// where it is the proxy's dialect being accommodated.
+///
+/// Every rule below was MEASURED against a live sepolia light client, not inferred.
+pub fn verified_params(method: &str, params: &Value) -> Value {
+    let mut p = params.as_array().cloned().unwrap_or_default();
+    match method {
+        // A hex blockCount returns success:true with EMPTY arrays — no error, just nothing.
+        "eth_feeHistory" => {
+            if let Some(Value::String(h)) = p.first().cloned() {
+                if let Some(n) = h.strip_prefix("0x").and_then(|x| u64::from_str_radix(x, 16).ok()) {
+                    p[0] = json!(n);
+                }
+            }
+        }
+        // "pending" is REFUSED and unverifiable by construction: a light client proves against
+        // a header's stateRoot and pending has no canonical header. "latest" is the only tag
+        // that works — which is what makes nonce reservation load-bearing in verified mode.
+        "eth_getTransactionCount" => {
+            if p.len() >= 2 && p[1] == json!("pending") {
+                p[1] = json!("latest");
+            }
+        }
+        // Upstream extends these with a third positional `optimisticStateFetch`; a one-arg
+        // eth_estimateGas is refused outright with "parameters missing".
+        "eth_call" | "eth_estimateGas" | "eth_createAccessList" => {
+            while p.len() < 2 {
+                p.push(json!("latest"));
+            }
+            if p.len() == 2 {
+                p.push(json!(false));
+            }
+        }
+        _ => {}
+    }
+    Value::Array(p)
+}
+
+/// Supplies the verified leg. Implemented in the Logos glue, which owns the module call, so
+/// `rpc.rs` stays free of Logos dependencies and the routing DECISION stays unit-testable.
+pub trait VerifiedRouter: Send + Sync {
+    /// Dispatch through the proxy. `Err` is a refusal, never a licence to fall back.
+    fn call(&self, chain_id: u64, method: &str, params: &Value) -> std::result::Result<Value, String>;
+}
+
 /// The RPC client: a persisted map of chainId → [`ChainConfig`].
 pub struct EthRpc {
     chains: HashMap<u64, ChainConfig>,
     store_path: Option<PathBuf>,
+    verified: Option<std::sync::Arc<dyn VerifiedRouter>>,
 }
 
 impl EthRpc {
     pub fn new() -> Self {
-        Self { chains: HashMap::new(), store_path: None }
+        Self { chains: HashMap::new(), store_path: None, verified: None }
     }
 
     /// Open a store backed by `path` (a JSON file), loading any existing config.
@@ -99,9 +219,67 @@ impl EthRpc {
         }
     }
 
-    pub fn set_chain_config(&mut self, chain_id: u64, cfg: ChainConfig) {
+    pub fn set_verified_router(&mut self, r: std::sync::Arc<dyn VerifiedRouter>) {
+        self.verified = Some(r);
+    }
+
+    pub fn set_chain_config(&mut self, chain_id: u64, cfg: ChainConfig) -> std::result::Result<(), String> {
+        cfg.validate()?;
         self.chains.insert(chain_id, cfg);
         self.persist();
+        Ok(())
+    }
+
+    /// Seed a chain only where it is ABSENT, per field. `chains.json` is shared with other
+    /// wallets on this device: a blanket overwrite silently retunes theirs, and a blanket skip
+    /// leaves a stale value we own. Returns the fields actually written.
+    pub fn ensure_chain_config(&mut self, chain_id: u64, cfg: &ChainConfig) -> Vec<String> {
+        let mut seeded = Vec::new();
+        match self.chains.get_mut(&chain_id) {
+            None => {
+                self.chains.insert(chain_id, cfg.clone());
+                seeded.push("*".to_string());
+            }
+            Some(existing) => {
+                if existing.endpoint.trim().is_empty() && !cfg.endpoint.trim().is_empty() {
+                    existing.endpoint = cfg.endpoint.clone();
+                    seeded.push("endpoint".into());
+                }
+            }
+        }
+        if !seeded.is_empty() {
+            self.persist();
+        }
+        seeded
+    }
+
+    /// Overwrite only the transport timeouts this module owns. Lowering a DEFAULT is useless
+    /// without this: an existing chains.json already carries the old value and `load` prefers
+    /// what is on disk.
+    pub fn patch_chain_transport(&mut self, chain_id: u64, timeout_secs: Option<u64>, verified_timeout_secs: Option<u64>) -> bool {
+        let Some(c) = self.chains.get_mut(&chain_id) else { return false };
+        if let Some(t) = timeout_secs { c.timeout_secs = t; }
+        if let Some(t) = verified_timeout_secs { c.verified_timeout_secs = t; }
+        self.persist();
+        true
+    }
+
+    pub fn set_verified_proxy_mode(&mut self, chain_id: u64, mode: VerifiedProxyMode) -> std::result::Result<(), String> {
+        let Some(c) = self.chains.get_mut(&chain_id) else {
+            return Err(format!("no configuration for chain {chain_id}"));
+        };
+        let previous = c.verified_proxy_mode;
+        c.verified_proxy_mode = mode;
+        if let Err(e) = c.validate() {
+            c.verified_proxy_mode = previous;
+            return Err(e);
+        }
+        self.persist();
+        Ok(())
+    }
+
+    pub fn verified_timeout(&self, chain_id: u64) -> Option<u64> {
+        self.chains.get(&chain_id).map(|c| c.verified_timeout_secs)
     }
 
     pub fn get_chain_config(&self, chain_id: u64) -> Option<&ChainConfig> {
@@ -130,8 +308,27 @@ impl EthRpc {
 
     /// Issue a raw JSON-RPC call and return the `result` value (or an error).
     pub fn rpc_call(&self, chain_id: u64, method: &str, params: Value) -> Result<Value> {
+        self.rpc_call_routed(chain_id, method, params).map(|(v, _)| v)
+    }
+
+    /// The routing decision, in the one place every typed method already funnels through.
+    /// Returns the value and whether it is proof-backed, so a caller can report which it got
+    /// rather than inferring it from the mode.
+    pub fn rpc_call_routed(&self, chain_id: u64, method: &str, params: Value) -> Result<(Value, Option<VerifiedClass>)> {
+        let cfg = self.chains.get(&chain_id).ok_or(RpcError::UnknownChain(chain_id))?;
+        if cfg.verified_proxy_mode == VerifiedProxyMode::Required {
+            let router = self
+                .verified
+                .as_ref()
+                .ok_or_else(|| RpcError::VerifiedProxy("no verified proxy is wired up".into()))?;
+            let coerced = verified_params(method, &params);
+            // REFUSE on failure. Falling back would answer a request for a verified number
+            // with an unverified one, which is worse than no answer at all.
+            let v = router.call(chain_id, method, &coerced).map_err(RpcError::VerifiedProxy)?;
+            return Ok((v, Some(verified_class(method))));
+        }
         let (client, endpoint) = self.client_for(chain_id)?;
-        Self::post_rpc(&client, &endpoint, method, params)
+        Self::post_rpc(&client, &endpoint, method, params).map(|v| (v, None))
     }
 
     /// Like [`Self::rpc_call`] but POSTs to an explicit `url` instead of the
@@ -241,7 +438,8 @@ mod tests {
     use std::net::TcpListener;
 
     fn cfg(endpoint: &str) -> ChainConfig {
-        ChainConfig { endpoint: endpoint.into(), proxy: None, proxy_required: false, timeout_secs: 5 }
+        ChainConfig { endpoint: endpoint.into(), proxy: None, proxy_required: false, timeout_secs: 5,
+            verified_proxy_mode: VerifiedProxyMode::Off, verified_timeout_secs: 15 }
     }
 
     #[test]
@@ -285,9 +483,10 @@ mod tests {
                 endpoint: "https://eth.example".into(),
                 proxy: None,
                 proxy_required: true, // requires a proxy, but none configured
-                timeout_secs: 5,
+                timeout_secs: 5, verified_proxy_mode: VerifiedProxyMode::Off, verified_timeout_secs: 15,
             },
-        );
+        )
+        .unwrap();
         // Must refuse via the proxy chokepoint — no request is attempted.
         match r.get_balance(1, "0x0000000000000000000000000000000000000000") {
             Err(RpcError::Proxy(_)) => {}
@@ -343,5 +542,164 @@ mod tests {
             }
             other => panic!("expected Rpc error, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod verified_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Records what the verified leg was asked for, so the coercion is asserted ON THE WIRE
+    /// rather than by re-reading the function that performs it.
+    struct SpyRouter {
+        seen: Mutex<Vec<(String, Value)>>,
+        answer: std::result::Result<Value, String>,
+    }
+    impl SpyRouter {
+        fn ok(v: Value) -> Arc<Self> { Arc::new(Self { seen: Mutex::new(vec![]), answer: Ok(v) }) }
+        fn failing() -> Arc<Self> {
+            Arc::new(Self { seen: Mutex::new(vec![]), answer: Err("proxy is not running".into()) })
+        }
+        fn last(&self) -> (String, Value) { self.seen.lock().unwrap().last().cloned().unwrap() }
+        fn count(&self) -> usize { self.seen.lock().unwrap().len() }
+    }
+    impl VerifiedRouter for SpyRouter {
+        fn call(&self, _c: u64, m: &str, p: &Value) -> std::result::Result<Value, String> {
+            self.seen.lock().unwrap().push((m.to_string(), p.clone()));
+            self.answer.clone()
+        }
+    }
+
+    fn cfg(mode: VerifiedProxyMode) -> ChainConfig {
+        ChainConfig {
+            // Deliberately unreachable: if routing ever falls through to the direct path the
+            // test fails, rather than quietly passing against a real node.
+            endpoint: "http://127.0.0.1:1/never".into(),
+            proxy: None, proxy_required: false, timeout_secs: 1,
+            verified_proxy_mode: mode, verified_timeout_secs: 1,
+        }
+    }
+    fn verified_rpc(router: Arc<SpyRouter>) -> EthRpc {
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Required)).unwrap();
+        r.set_verified_router(router);
+        r
+    }
+
+    #[test]
+    fn fee_history_block_count_becomes_a_number_on_the_verified_leg_only() {
+        let spy = SpyRouter::ok(json!({ "baseFeePerGas": ["0x1"] }));
+        let r = verified_rpc(spy.clone());
+        r.fee_history(1, 4, json!([25])).unwrap();
+        let (m, p) = spy.last();
+        assert_eq!(m, "eth_feeHistory");
+        assert_eq!(p[0], json!(4), "a hex blockCount returns success with EMPTY arrays");
+        // The spec-conformant hex is untouched off the verified leg: verified_params is the
+        // ONLY place this differs, so a real node still gets what the spec says.
+        assert_eq!(verified_params("eth_getBalance", &json!(["0xa", "latest"]))[1], json!("latest"));
+    }
+
+    #[test]
+    fn pending_becomes_latest_because_pending_is_unverifiable() {
+        let spy = SpyRouter::ok(json!("0x7"));
+        let r = verified_rpc(spy.clone());
+        r.get_transaction_count(1, "0xabc").unwrap();
+        assert_eq!(spy.last().1[1], json!("latest"), "a light client has no header for `pending`");
+    }
+
+    #[test]
+    fn estimate_gas_and_call_gain_the_upstream_third_parameter() {
+        let spy = SpyRouter::ok(json!("0x5208"));
+        let r = verified_rpc(spy.clone());
+        r.estimate_gas(1, json!({ "to": "0xabc" })).unwrap();
+        let (_, p) = spy.last();
+        assert_eq!(p.as_array().unwrap().len(), 3, "a one-arg estimate_gas is refused outright");
+        assert_eq!(p[2], json!(false));
+        r.call(1, json!({ "to": "0xabc" })).unwrap();
+        assert_eq!(spy.last().1.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_failing_verified_leg_refuses_and_never_falls_back() {
+        let spy = SpyRouter::failing();
+        let r = verified_rpc(spy.clone());
+        let e = r.get_balance(1, "0xabc").unwrap_err();
+        assert!(matches!(e, RpcError::VerifiedProxy(_)), "got {e}");
+        assert!(e.to_string().contains("proxy is not running"));
+        assert_eq!(spy.count(), 1, "one attempt, and no retry against the endpoint");
+    }
+
+    #[test]
+    fn only_proof_backed_reads_are_classed_verified() {
+        for m in ["eth_getBalance", "eth_getTransactionCount", "eth_getCode",
+                  "eth_getStorageAt", "eth_call"] {
+            assert_eq!(verified_class(m), VerifiedClass::Verified, "{m}");
+        }
+        // A light client cannot prove a fee oracle's opinion or that a broadcast landed.
+        for m in ["eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory",
+                  "eth_estimateGas", "eth_sendRawTransaction", "eth_blockNumber"] {
+            assert_eq!(verified_class(m), VerifiedClass::Proxied, "{m}");
+        }
+    }
+
+    #[test]
+    fn off_mode_never_touches_the_router() {
+        let spy = SpyRouter::ok(json!("0x1"));
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap();
+        r.set_verified_router(spy.clone());
+        let _ = r.get_balance(1, "0xabc"); // fails on the dead endpoint, which is the point
+        assert_eq!(spy.count(), 0, "off mode must not route");
+    }
+
+    #[test]
+    fn a_socks_proxy_and_verified_routing_cannot_both_be_required() {
+        let mut r = EthRpc::new();
+        let bad = ChainConfig {
+            endpoint: "https://x".into(),
+            proxy: Some("socks5h://127.0.0.1:9050".into()),
+            proxy_required: true, timeout_secs: 8,
+            verified_proxy_mode: VerifiedProxyMode::Required, verified_timeout_secs: 15,
+        };
+        assert!(bad.validate().is_err());
+        assert!(r.set_chain_config(1, bad).is_err(), "the store must refuse the contradiction");
+        assert!(r.get_chain_config(1).is_none());
+    }
+
+    #[test]
+    fn ensure_seeds_an_absent_chain_but_never_clobbers_a_configured_endpoint() {
+        let mut r = EthRpc::new();
+        let mine = cfg(VerifiedProxyMode::Off);
+        assert_eq!(r.ensure_chain_config(1, &mine), vec!["*".to_string()]);
+        let theirs = ChainConfig { endpoint: "https://theirs".into(), ..mine.clone() };
+        assert!(r.ensure_chain_config(1, &theirs).is_empty(), "an existing endpoint is the user's");
+        assert_eq!(r.get_chain_config(1).unwrap().endpoint, "http://127.0.0.1:1/never");
+    }
+
+    #[test]
+    fn patch_rewrites_the_timeouts_we_own_and_nothing_else() {
+        let mut r = EthRpc::new();
+        let mut c = cfg(VerifiedProxyMode::Off);
+        c.timeout_secs = 30;
+        c.endpoint = "https://mine".into();
+        r.set_chain_config(1, c).unwrap();
+        assert!(r.patch_chain_transport(1, Some(8), Some(15)));
+        let got = r.get_chain_config(1).unwrap();
+        assert_eq!((got.timeout_secs, got.verified_timeout_secs), (8, 15));
+        assert_eq!(got.endpoint, "https://mine", "the user's endpoint is untouched");
+        assert!(!r.patch_chain_transport(999, Some(8), None));
+    }
+
+    #[test]
+    fn switching_mode_on_a_socks_required_chain_is_refused_and_rolled_back() {
+        let mut r = EthRpc::new();
+        let mut c = cfg(VerifiedProxyMode::Off);
+        c.proxy = Some("socks5h://1".into());
+        c.proxy_required = true;
+        r.set_chain_config(1, c).unwrap();
+        assert!(r.set_verified_proxy_mode(1, VerifiedProxyMode::Required).is_err());
+        assert_eq!(r.get_chain_config(1).unwrap().verified_proxy_mode, VerifiedProxyMode::Off,
+                   "a refused switch must not leave the mode changed");
     }
 }
