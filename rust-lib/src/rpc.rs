@@ -168,6 +168,33 @@ pub fn verified_params(method: &str, params: &Value) -> Value {
     Value::Array(p)
 }
 
+/// Normalise a verified-leg RESULT back to what a JSON-RPC node would have returned.
+///
+/// The proxy's encoding is not uniform with the wire format, and the differences are silent:
+/// `eth_call` answers a BYTE ARRAY where a node answers a hex string, and `eth_blockNumber`
+/// answers a JSON number where a node answers a hex quantity. A consumer decoding hex gets
+/// garbage from the first and a type error from the second — with no error anywhere, because
+/// both are perfectly valid JSON. Measured against mainnet, both directions.
+///
+/// Only shapes that are unambiguously the proxy's dialect are rewritten; anything already in
+/// wire form passes through untouched.
+pub fn normalize_verified_result(v: Value) -> Value {
+    match &v {
+        // A byte array — every element a small integer — is `bytes` the node would have hex'd.
+        Value::Array(items)
+            if !items.is_empty()
+                && items.iter().all(|i| i.as_u64().is_some_and(|n| n <= 255)) =>
+        {
+            let hex: String =
+                items.iter().map(|i| format!("{:02x}", i.as_u64().unwrap_or(0))).collect();
+            Value::String(format!("0x{hex}"))
+        }
+        // A bare number where the wire carries a QUANTITY.
+        Value::Number(n) if n.is_u64() => Value::String(format!("0x{:x}", n.as_u64().unwrap_or(0))),
+        _ => v,
+    }
+}
+
 /// Supplies the verified leg. Implemented in the Logos glue, which owns the module call, so
 /// `rpc.rs` stays free of Logos dependencies and the routing DECISION stays unit-testable.
 pub trait VerifiedRouter: Send + Sync {
@@ -325,7 +352,7 @@ impl EthRpc {
             // REFUSE on failure. Falling back would answer a request for a verified number
             // with an unverified one, which is worse than no answer at all.
             let v = router.call(chain_id, method, &coerced).map_err(RpcError::VerifiedProxy)?;
-            return Ok((v, Some(verified_class(method))));
+            return Ok((normalize_verified_result(v), Some(verified_class(method))));
         }
         let (client, endpoint) = self.client_for(chain_id)?;
         Self::post_rpc(&client, &endpoint, method, params).map(|v| (v, None))
@@ -628,6 +655,36 @@ mod verified_tests {
         assert!(matches!(e, RpcError::VerifiedProxy(_)), "got {e}");
         assert!(e.to_string().contains("proxy is not running"));
         assert_eq!(spy.count(), 1, "one attempt, and no retry against the endpoint");
+    }
+
+    #[test]
+    fn a_byte_array_result_is_normalised_back_to_a_hex_string() {
+        // eth_call through the proxy answers a BYTE ARRAY where a node answers "0x...".
+        // Measured on mainnet: symbol() on WETH came back as [0,0,...,87,69,84,72,...].
+        let spy = SpyRouter::ok(json!([0, 32, 87, 69, 84, 72]));
+        let r = verified_rpc(spy);
+        assert_eq!(r.call(1, json!({ "to": "0xabc" })).unwrap(), "0x00205745544 8".replace(" ", ""));
+    }
+
+    #[test]
+    fn a_bare_number_result_is_normalised_back_to_a_hex_quantity() {
+        // eth_blockNumber answers a JSON number through the proxy and a hex string directly.
+        let spy = SpyRouter::ok(json!(11579774u64));
+        let r = verified_rpc(spy);
+        assert_eq!(r.block_number(1).unwrap(), "0xb0b17e");
+    }
+
+    #[test]
+    fn a_result_already_in_wire_form_is_left_alone() {
+        let spy = SpyRouter::ok(json!("0x1afd6402e6259dc342259"));
+        let r = verified_rpc(spy);
+        assert_eq!(r.get_balance(1, "0xabc").unwrap(), "0x1afd6402e6259dc342259");
+        // …and a structured reply keeps its shape: feeHistory's arrays hold hex STRINGS, so
+        // the byte-array rule must not fire on them.
+        let spy2 = SpyRouter::ok(json!({ "baseFeePerGas": ["0x59bceec"], "oldestBlock": "0x1" }));
+        let r2 = verified_rpc(spy2);
+        let v = r2.fee_history(1, 4, json!([50])).unwrap();
+        assert_eq!(v["baseFeePerGas"][0], json!("0x59bceec"));
     }
 
     #[test]
