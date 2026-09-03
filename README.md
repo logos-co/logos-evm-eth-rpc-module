@@ -18,6 +18,28 @@ Config: `set_chain_config(chainId, {endpoint, proxy?, proxyRequired?, timeoutSec
 `gas_price`, `fee_history`, `estimate_gas`, `send_raw_transaction`,
 `get_transaction_receipt`, `get_transaction_by_hash`, `raw_rpc`.
 
+## Working with no configuration at all
+
+The module ships defaults, so a consumer needs no UI app installed to work. Ask
+`config_status()` — `{ ok, state, source, chains }`, where `state` is `unready`
+(context not ready — ask again), `unconfigured`, or `configured` — then call
+`init_defaults()`, which seeds these per chain and per **field**, only where absent:
+
+| Chain | id | Endpoint |
+|---|---|---|
+| Ethereum | `1` | `https://ethereum-rpc.publicnode.com` |
+| Sepolia | `11155111` | `https://ethereum-sepolia-rpc.publicnode.com` |
+| Hoodi | `560048` | `https://ethereum-hoodi-rpc.publicnode.com` |
+
+`init_defaults` is idempotent — including across restarts — so it may be called
+unconditionally; `applied: false` is not an error. It writes over nothing: an endpoint,
+verified mode or proxy policy already stored is left alone, and a record's `source` moves
+one way only, `default` → `external`, as soon as any caller writes to it.
+
+> **All three defaults are one operator.** publicnode sees the traffic of every
+> default-configured wallet. Set your own endpoint (or a SOCKS proxy) in `eth_rpc_ui` if
+> that matters to you — the defaults exist so the wallet works, not because they are private.
+
 ## Build & test
 
 ```bash

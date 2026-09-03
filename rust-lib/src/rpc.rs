@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,6 +28,12 @@ fn default_verified_timeout() -> u64 {
     15
 }
 
+/// The verified leg's per-call budget, from the chain's `verifiedTimeoutSecs`. Clamped because
+/// the value is user-supplied: 0 would time out instantly and an unbounded one never returns.
+fn verified_budget(secs: u64) -> Duration {
+    Duration::from_secs(secs.clamp(1, 60))
+}
+
 /// How JSON-RPC for a chain should be routed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +45,22 @@ pub enum VerifiedProxyMode {
     /// `preferred` mode on purpose: quietly answering from an unverified source when the user
     /// asked for verification is the failure this feature exists to prevent.
     Required,
+}
+
+/// Who wrote a chain's record. Reporting only — [`EthRpc::ensure_chain_config`] is what
+/// actually refuses to overwrite. [`ChainConfigWire`] omits it and
+/// [`ChainConfig::from_caller_json`] overwrites it, so a caller cannot declare its own write
+/// to be a default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfigSource {
+    /// A caller wrote it — and the default on READ: a record already on disk was written by
+    /// somebody, and calling it ours would license `init_defaults` to overwrite it.
+    #[default]
+    External,
+    /// `init_defaults` wrote it from [`DEFAULT_ENDPOINTS`].
+    #[serde(rename = "default")]
+    Builtin,
 }
 
 /// Per-chain configuration. `endpoint` is the JSON-RPC URL; `proxy` /
@@ -60,9 +83,44 @@ pub struct ChainConfig {
     pub verified_proxy_mode: VerifiedProxyMode,
     #[serde(default = "default_verified_timeout")]
     pub verified_timeout_secs: u64,
+    /// Absent on a `chains.json` written before this field existed → `external`.
+    #[serde(default)]
+    pub source: ConfigSource,
 }
 
+/// The endpoints `init_defaults` seeds, so a fresh device works with no UI app installed.
+/// Measured live 2026-08-28. One per chain, not a list: a silent failover changes WHICH node
+/// answered without the consumer knowing. All three are one operator — a reason `eth_rpc_ui`
+/// and the SOCKS proxy exist, not a reason to ship an endpoint that does not work.
+pub const DEFAULT_ENDPOINTS: &[(u64, &str)] = &[
+    (1, "https://ethereum-rpc.publicnode.com"),
+    (11155111, "https://ethereum-sepolia-rpc.publicnode.com"),
+    (560048, "https://ethereum-hoodi-rpc.publicnode.com"),
+];
+
 impl ChainConfig {
+    /// The built-in record for `endpoint`. Verified routing is OFF: it needs an archive node
+    /// the public defaults are not, and `validate` refuses it beside `proxyRequired`.
+    pub fn builtin(endpoint: &str) -> Self {
+        ChainConfig {
+            endpoint: endpoint.into(),
+            proxy: None,
+            proxy_required: false,
+            timeout_secs: default_timeout(),
+            verified_proxy_mode: VerifiedProxyMode::Off,
+            verified_timeout_secs: default_verified_timeout(),
+            source: ConfigSource::Builtin,
+        }
+    }
+
+    /// Parse caller JSON, forcing `source`. The field stays deserializable so `chains.json`
+    /// reads back, but a caller writing a record makes it theirs whatever it claims.
+    pub fn from_caller_json(json: &str) -> std::result::Result<Self, serde_json::Error> {
+        let mut cfg: ChainConfig = serde_json::from_str(json)?;
+        cfg.source = ConfigSource::External;
+        Ok(cfg)
+    }
+
     /// `proxyRequired` together with verified routing is a contradiction we refuse rather
     /// than silently resolve: the verified proxy makes its own outbound connections and knows
     /// nothing about our SOCKS config, so honouring both is impossible and honouring either
@@ -78,6 +136,52 @@ impl ChainConfig {
     }
 }
 
+/// The wire form of a chain config, as a caller sends it to `set_chain_config`.
+///
+/// The verified fields are `Option` here and NOT in [`ChainConfig`], because on the wire an
+/// omitted key must preserve what is stored: a sibling wallet that predates verified routing
+/// sends `{endpoint, proxy, proxyRequired, timeoutSecs}` on every start, and under a whole-record
+/// write its silence revoked the user's verified mode with the UI honestly reporting "off".
+/// Only an explicit `"off"` may lower it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainConfigWire {
+    pub endpoint: String,
+    #[serde(default)]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub proxy_required: bool,
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub verified_proxy_mode: Option<VerifiedProxyMode>,
+    #[serde(default)]
+    pub verified_timeout_secs: Option<u64>,
+}
+
+impl ChainConfigWire {
+    /// Resolve against what is stored: omitted verified fields keep the stored value, or the
+    /// default where the chain is new.
+    pub fn resolve(self, existing: Option<&ChainConfig>) -> ChainConfig {
+        ChainConfig {
+            endpoint: self.endpoint,
+            proxy: self.proxy,
+            proxy_required: self.proxy_required,
+            timeout_secs: self.timeout_secs,
+            verified_proxy_mode: self
+                .verified_proxy_mode
+                .or_else(|| existing.map(|c| c.verified_proxy_mode))
+                .unwrap_or_default(),
+            verified_timeout_secs: self
+                .verified_timeout_secs
+                .or_else(|| existing.map(|c| c.verified_timeout_secs))
+                .unwrap_or_else(default_verified_timeout),
+            // Not resolved from the wire: a caller writing a record makes it theirs.
+            source: ConfigSource::External,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum RpcError {
     UnknownChain(u64),
@@ -88,6 +192,9 @@ pub enum RpcError {
     /// The verified path could not answer. NEVER downgraded to a direct call: a caller who
     /// asked for verification gets an error, not an unverified number.
     VerifiedProxy(String),
+    /// A read the verified route PROVES was asked for through an explicit url, which cannot
+    /// prove anything. Refused rather than answered in the clear.
+    VerifiedBypass(String),
 }
 
 impl std::fmt::Display for RpcError {
@@ -98,6 +205,11 @@ impl std::fmt::Display for RpcError {
             RpcError::Http(e) => write!(f, "http: {e}"),
             RpcError::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
             RpcError::VerifiedProxy(e) => write!(f, "verified proxy: {e}"),
+            RpcError::VerifiedBypass(m) => write!(
+                f,
+                "{m} is proof-backed on this chain's verified route: refused through an \
+                 explicit url, which cannot prove it (use raw_rpc)"
+            ),
             RpcError::Parse(e) => write!(f, "parse: {e}"),
         }
     }
@@ -123,6 +235,32 @@ pub fn verified_class(method: &str) -> VerifiedClass {
         | "eth_call" => VerifiedClass::Verified,
         _ => VerifiedClass::Proxied,
     }
+}
+
+/// The wire label for how an answer was obtained, so a UI can badge a proven balance
+/// differently from a fee figure the proxy merely forwarded. `None` never touched the proxy.
+pub fn route_label(class: Option<VerifiedClass>) -> &'static str {
+    match class {
+        Some(VerifiedClass::Verified) => "verified",
+        Some(VerifiedClass::Proxied) => "proxied",
+        None => "direct",
+    }
+}
+
+/// The JSON-RPC method each typed helper issues. Named once so a caller can ask
+/// [`EthRpc::route_of`] about a helper without re-typing — and mistyping — the name.
+pub mod methods {
+    pub const CHAIN_ID: &str = "eth_chainId";
+    pub const BLOCK_NUMBER: &str = "eth_blockNumber";
+    pub const GET_BALANCE: &str = "eth_getBalance";
+    pub const CALL: &str = "eth_call";
+    pub const GET_TRANSACTION_COUNT: &str = "eth_getTransactionCount";
+    pub const GAS_PRICE: &str = "eth_gasPrice";
+    pub const FEE_HISTORY: &str = "eth_feeHistory";
+    pub const ESTIMATE_GAS: &str = "eth_estimateGas";
+    pub const SEND_RAW_TRANSACTION: &str = "eth_sendRawTransaction";
+    pub const GET_TRANSACTION_RECEIPT: &str = "eth_getTransactionReceipt";
+    pub const GET_TRANSACTION_BY_HASH: &str = "eth_getTransactionByHash";
 }
 
 /// Rewrite params for the verified leg ONLY.
@@ -198,8 +336,11 @@ pub fn normalize_verified_result(v: Value) -> Value {
 /// Supplies the verified leg. Implemented in the Logos glue, which owns the module call, so
 /// `rpc.rs` stays free of Logos dependencies and the routing DECISION stays unit-testable.
 pub trait VerifiedRouter: Send + Sync {
-    /// Dispatch through the proxy. `Err` is a refusal, never a licence to fall back.
-    fn call(&self, chain_id: u64, method: &str, params: &Value) -> std::result::Result<Value, String>;
+    /// Dispatch through the proxy within `budget`. Passed per call, not configured on the
+    /// router: a router holding its own copy is a second place the user's setting can go stale.
+    /// `Err` is a refusal, never a licence to fall back.
+    fn call(&self, chain_id: u64, method: &str, params: &Value, budget: Duration)
+        -> std::result::Result<Value, String>;
 }
 
 /// The RPC client: a persisted map of chainId → [`ChainConfig`].
@@ -257,6 +398,15 @@ impl EthRpc {
         Ok(())
     }
 
+    /// Apply a config as a CALLER sent it: omitted verified fields keep what is stored, so a
+    /// wallet that never heard of verified routing cannot revoke it by silence. An incoming
+    /// `proxyRequired` that now contradicts the stored mode is refused, not resolved —
+    /// resolving it is what silently dropped the mode before.
+    pub fn apply_chain_config(&mut self, chain_id: u64, wire: ChainConfigWire) -> std::result::Result<(), String> {
+        let cfg = wire.resolve(self.chains.get(&chain_id));
+        self.set_chain_config(chain_id, cfg)
+    }
+
     /// Seed a chain only where it is ABSENT, per field. `chains.json` is shared with other
     /// wallets on this device: a blanket overwrite silently retunes theirs, and a blanket skip
     /// leaves a stale value we own. Returns the fields actually written.
@@ -271,6 +421,10 @@ impl EthRpc {
                 if existing.endpoint.trim().is_empty() && !cfg.endpoint.trim().is_empty() {
                     existing.endpoint = cfg.endpoint.clone();
                     seeded.push("endpoint".into());
+                    // `source` only ever climbs: a caller's value makes the record theirs.
+                    if cfg.source == ConfigSource::External {
+                        existing.source = ConfigSource::External;
+                    }
                 }
             }
         }
@@ -280,6 +434,66 @@ impl EthRpc {
         seeded
     }
 
+    /// Seed every chain in [`DEFAULT_ENDPOINTS`], per field and only where ABSENT. Idempotent:
+    /// a second call from any consumer finds each field present and writes nothing.
+    /// Returns what each chain actually gained, so a caller can tell seeding from a no-op.
+    pub fn init_defaults(&mut self) -> Vec<(u64, Vec<String>)> {
+        DEFAULT_ENDPOINTS
+            .iter()
+            .map(|&(id, url)| (id, self.ensure_chain_config(id, &ChainConfig::builtin(url))))
+            .collect()
+    }
+
+    /// Whether a config has been SET, per chain and rolled up. The roll-up is for DISPLAY: a
+    /// store with chain 1 configured and 11155111 absent rolls up to `configured` while still
+    /// needing seeding, so a consumer calls `init_defaults` unconditionally rather than gating.
+    pub fn config_status(&self) -> Value {
+        let mut ids: Vec<u64> = self.chains.keys().copied().collect();
+        ids.extend(DEFAULT_ENDPOINTS.iter().map(|&(id, _)| id));
+        ids.sort_unstable();
+        ids.dedup();
+        let chains: Vec<Value> = ids
+            .iter()
+            .map(|id| match self.chains.get(id) {
+                Some(c) => json!({ "chainId": id, "state": "configured", "source": c.source,
+                                   "endpoint": c.endpoint,
+                                   "verifiedProxyMode": c.verified_proxy_mode }),
+                None => json!({ "chainId": id, "state": "unconfigured", "source": "none" }),
+            })
+            .collect();
+        let (state, source) = if self.chains.is_empty() {
+            ("unconfigured", "none")
+        } else if self.chains.values().any(|c| c.source == ConfigSource::External) {
+            ("configured", "external")
+        } else {
+            ("configured", "default")
+        };
+        json!({ "ok": true, "state": state, "source": source, "chains": chains })
+    }
+
+    /// Overwrite ONLY the endpoint, creating the chain with defaults where it is absent.
+    /// `chains.json` is shared with other wallets on this device, so a user retyping an
+    /// endpoint must not silently reset their verified-proxy mode or timeouts.
+    pub fn patch_chain_endpoint(&mut self, chain_id: u64, endpoint: &str) -> bool {
+        let e = endpoint.trim();
+        if e.is_empty() {
+            return false;
+        }
+        // A user typing an endpoint owns that chain from here on, defaulted or not.
+        match self.chains.get_mut(&chain_id) {
+            Some(c) => {
+                c.endpoint = e.to_string();
+                c.source = ConfigSource::External;
+            }
+            None => {
+                let c = ChainConfig { source: ConfigSource::External, ..ChainConfig::builtin(e) };
+                self.chains.insert(chain_id, c);
+            }
+        }
+        self.persist();
+        true
+    }
+
     /// Overwrite only the transport timeouts this module owns. Lowering a DEFAULT is useless
     /// without this: an existing chains.json already carries the old value and `load` prefers
     /// what is on disk.
@@ -287,6 +501,9 @@ impl EthRpc {
         let Some(c) = self.chains.get_mut(&chain_id) else { return false };
         if let Some(t) = timeout_secs { c.timeout_secs = t; }
         if let Some(t) = verified_timeout_secs { c.verified_timeout_secs = t; }
+        if timeout_secs.is_some() || verified_timeout_secs.is_some() {
+            c.source = ConfigSource::External;
+        }
         self.persist();
         true
     }
@@ -301,16 +518,25 @@ impl EthRpc {
             c.verified_proxy_mode = previous;
             return Err(e);
         }
+        c.source = ConfigSource::External;
         self.persist();
         Ok(())
     }
 
-    pub fn verified_timeout(&self, chain_id: u64) -> Option<u64> {
-        self.chains.get(&chain_id).map(|c| c.verified_timeout_secs)
-    }
-
     pub fn get_chain_config(&self, chain_id: u64) -> Option<&ChainConfig> {
         self.chains.get(&chain_id)
+    }
+
+    /// How a call to `method` on `chain_id` is routed, without making it — the same decision
+    /// [`Self::rpc_call_routed`] makes, so a caller holding an answer can label it rather than
+    /// infer "verified" from the mode and badge a forwarded fee figure as proven.
+    pub fn route_of(&self, chain_id: u64, method: &str) -> Option<VerifiedClass> {
+        match self.chains.get(&chain_id) {
+            Some(c) if c.verified_proxy_mode == VerifiedProxyMode::Required => {
+                Some(verified_class(method))
+            }
+            _ => None,
+        }
     }
 
     pub fn remove_chain_config(&mut self, chain_id: u64) -> bool {
@@ -351,7 +577,9 @@ impl EthRpc {
             let coerced = verified_params(method, &params);
             // REFUSE on failure. Falling back would answer a request for a verified number
             // with an unverified one, which is worse than no answer at all.
-            let v = router.call(chain_id, method, &coerced).map_err(RpcError::VerifiedProxy)?;
+            let v = router
+                .call(chain_id, method, &coerced, verified_budget(cfg.verified_timeout_secs))
+                .map_err(RpcError::VerifiedProxy)?;
             return Ok((normalize_verified_result(v), Some(verified_class(method))));
         }
         let (client, endpoint) = self.client_for(chain_id)?;
@@ -364,6 +592,13 @@ impl EthRpc {
     /// ERC-4337 bundler (`eth_sendUserOperation`) — so they too go through
     /// net-proxy (a private send must not leak the user's IP to the bundler).
     pub fn rpc_call_url(&self, chain_id: u64, url: &str, method: &str, params: Value) -> Result<Value> {
+        // The line: a chain set to `required` asked for proof-backed reads, and an arbitrary url
+        // proves nothing — so exactly the methods the verified route PROVES are refused here.
+        // Submissions and bundler methods are `Proxied` even on the verified leg, so allowing
+        // them costs the guarantee nothing and keeps the one real caller working.
+        if self.route_of(chain_id, method) == Some(VerifiedClass::Verified) {
+            return Err(RpcError::VerifiedBypass(method.to_string()));
+        }
         // Build the client from the chain's proxy config; ignore its endpoint.
         let (client, _endpoint) = self.client_for(chain_id)?;
         Self::post_rpc(&client, url, method, params)
@@ -399,50 +634,50 @@ impl EthRpc {
 
     /// `eth_chainId` round-trip; returns the node's chain id as a decimal.
     pub fn verify_chain_id(&self, chain_id: u64) -> Result<u64> {
-        let s = self.result_str(chain_id, "eth_chainId", json!([]))?;
+        let s = self.result_str(chain_id, methods::CHAIN_ID, json!([]))?;
         parse_hex_u64(&s).ok_or_else(|| RpcError::Parse(format!("bad chainId: {s}")))
     }
 
     pub fn block_number(&self, chain_id: u64) -> Result<String> {
-        self.result_str(chain_id, "eth_blockNumber", json!([]))
+        self.result_str(chain_id, methods::BLOCK_NUMBER, json!([]))
     }
 
     pub fn get_balance(&self, chain_id: u64, address: &str) -> Result<String> {
-        self.result_str(chain_id, "eth_getBalance", json!([address, "latest"]))
+        self.result_str(chain_id, methods::GET_BALANCE, json!([address, "latest"]))
     }
 
     /// `eth_call`; `call` is a `{to, data, ...}` object (used for ERC20 reads).
     pub fn call(&self, chain_id: u64, call: Value) -> Result<String> {
-        self.result_str(chain_id, "eth_call", json!([call, "latest"]))
+        self.result_str(chain_id, methods::CALL, json!([call, "latest"]))
     }
 
     pub fn get_transaction_count(&self, chain_id: u64, address: &str) -> Result<String> {
-        self.result_str(chain_id, "eth_getTransactionCount", json!([address, "pending"]))
+        self.result_str(chain_id, methods::GET_TRANSACTION_COUNT, json!([address, "pending"]))
     }
 
     pub fn gas_price(&self, chain_id: u64) -> Result<String> {
-        self.result_str(chain_id, "eth_gasPrice", json!([]))
+        self.result_str(chain_id, methods::GAS_PRICE, json!([]))
     }
 
     pub fn fee_history(&self, chain_id: u64, blocks: u64, reward_percentiles: Value) -> Result<Value> {
         let block_hex = format!("0x{blocks:x}");
-        self.rpc_call(chain_id, "eth_feeHistory", json!([block_hex, "latest", reward_percentiles]))
+        self.rpc_call(chain_id, methods::FEE_HISTORY, json!([block_hex, "latest", reward_percentiles]))
     }
 
     pub fn estimate_gas(&self, chain_id: u64, tx: Value) -> Result<String> {
-        self.result_str(chain_id, "eth_estimateGas", json!([tx]))
+        self.result_str(chain_id, methods::ESTIMATE_GAS, json!([tx]))
     }
 
     pub fn send_raw_transaction(&self, chain_id: u64, raw_hex: &str) -> Result<String> {
-        self.result_str(chain_id, "eth_sendRawTransaction", json!([raw_hex]))
+        self.result_str(chain_id, methods::SEND_RAW_TRANSACTION, json!([raw_hex]))
     }
 
     pub fn get_transaction_receipt(&self, chain_id: u64, hash: &str) -> Result<Value> {
-        self.rpc_call(chain_id, "eth_getTransactionReceipt", json!([hash]))
+        self.rpc_call(chain_id, methods::GET_TRANSACTION_RECEIPT, json!([hash]))
     }
 
     pub fn get_transaction_by_hash(&self, chain_id: u64, hash: &str) -> Result<Value> {
-        self.rpc_call(chain_id, "eth_getTransactionByHash", json!([hash]))
+        self.rpc_call(chain_id, methods::GET_TRANSACTION_BY_HASH, json!([hash]))
     }
 }
 
@@ -466,7 +701,8 @@ mod tests {
 
     fn cfg(endpoint: &str) -> ChainConfig {
         ChainConfig { endpoint: endpoint.into(), proxy: None, proxy_required: false, timeout_secs: 5,
-            verified_proxy_mode: VerifiedProxyMode::Off, verified_timeout_secs: 15 }
+            verified_proxy_mode: VerifiedProxyMode::Off, verified_timeout_secs: 15,
+            source: ConfigSource::External }
     }
 
     #[test]
@@ -475,8 +711,8 @@ mod tests {
         let path = dir.path().join("chains.json");
         {
             let mut r = EthRpc::with_store(path.clone());
-            r.set_chain_config(1, cfg("https://eth.example"));
-            r.set_chain_config(10, cfg("https://op.example"));
+            r.set_chain_config(1, cfg("https://eth.example")).unwrap();
+            r.set_chain_config(10, cfg("https://op.example")).unwrap();
             assert_eq!(r.list_chains(), vec![1, 10]);
             assert!(r.remove_chain_config(10));
             assert_eq!(r.list_chains(), vec![1]);
@@ -511,6 +747,7 @@ mod tests {
                 proxy: None,
                 proxy_required: true, // requires a proxy, but none configured
                 timeout_secs: 5, verified_proxy_mode: VerifiedProxyMode::Off, verified_timeout_secs: 15,
+                source: ConfigSource::External,
             },
         )
         .unwrap();
@@ -544,7 +781,7 @@ mod tests {
     fn parses_get_balance_against_mock_node() {
         let url = mock_node(r#"{"jsonrpc":"2.0","id":1,"result":"0x1234"}"#);
         let mut r = EthRpc::new();
-        r.set_chain_config(1, cfg(&url));
+        r.set_chain_config(1, cfg(&url)).unwrap();
         let bal = r.get_balance(1, "0x0000000000000000000000000000000000000000").unwrap();
         assert_eq!(bal, "0x1234");
     }
@@ -553,7 +790,7 @@ mod tests {
     fn verify_chain_id_decodes_hex() {
         let url = mock_node(r#"{"jsonrpc":"2.0","id":1,"result":"0xa"}"#);
         let mut r = EthRpc::new();
-        r.set_chain_config(10, cfg(&url));
+        r.set_chain_config(10, cfg(&url)).unwrap();
         assert_eq!(r.verify_chain_id(10).unwrap(), 10);
     }
 
@@ -561,7 +798,7 @@ mod tests {
     fn surfaces_rpc_error() {
         let url = mock_node(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#);
         let mut r = EthRpc::new();
-        r.set_chain_config(1, cfg(&url));
+        r.set_chain_config(1, cfg(&url)).unwrap();
         match r.gas_price(1) {
             Err(RpcError::Rpc { code, message }) => {
                 assert_eq!(code, -32000);
@@ -581,19 +818,25 @@ mod verified_tests {
     /// rather than by re-reading the function that performs it.
     struct SpyRouter {
         seen: Mutex<Vec<(String, Value)>>,
+        budget: Mutex<Option<Duration>>,
         answer: std::result::Result<Value, String>,
     }
     impl SpyRouter {
-        fn ok(v: Value) -> Arc<Self> { Arc::new(Self { seen: Mutex::new(vec![]), answer: Ok(v) }) }
-        fn failing() -> Arc<Self> {
-            Arc::new(Self { seen: Mutex::new(vec![]), answer: Err("proxy is not running".into()) })
+        fn new(answer: std::result::Result<Value, String>) -> Arc<Self> {
+            Arc::new(Self { seen: Mutex::new(vec![]), budget: Mutex::new(None), answer })
         }
+        fn ok(v: Value) -> Arc<Self> { Self::new(Ok(v)) }
+        fn failing() -> Arc<Self> { Self::new(Err("proxy is not running".into())) }
         fn last(&self) -> (String, Value) { self.seen.lock().unwrap().last().cloned().unwrap() }
         fn count(&self) -> usize { self.seen.lock().unwrap().len() }
+        fn budget(&self) -> Option<Duration> { *self.budget.lock().unwrap() }
     }
     impl VerifiedRouter for SpyRouter {
-        fn call(&self, _c: u64, m: &str, p: &Value) -> std::result::Result<Value, String> {
+        fn call(&self, _c: u64, m: &str, p: &Value, budget: Duration)
+            -> std::result::Result<Value, String>
+        {
             self.seen.lock().unwrap().push((m.to_string(), p.clone()));
+            *self.budget.lock().unwrap() = Some(budget);
             self.answer.clone()
         }
     }
@@ -604,7 +847,7 @@ mod verified_tests {
             // test fails, rather than quietly passing against a real node.
             endpoint: "http://127.0.0.1:1/never".into(),
             proxy: None, proxy_required: false, timeout_secs: 1,
-            verified_proxy_mode: mode, verified_timeout_secs: 1,
+            verified_proxy_mode: mode, verified_timeout_secs: 1, source: ConfigSource::External,
         }
     }
     fn verified_rpc(router: Arc<SpyRouter>) -> EthRpc {
@@ -711,6 +954,28 @@ mod verified_tests {
     }
 
     #[test]
+    fn the_configured_verified_timeout_is_what_the_verified_leg_is_given() {
+        // It was persisted and read back but never reached the router, so every verified call
+        // used the router's hard-coded 15s and a user lowering it was silently ignored.
+        let spy = SpyRouter::ok(json!("0x1"));
+        let mut r = verified_rpc(spy.clone());
+        r.get_balance(1, "0xabc").unwrap();
+        assert_eq!(spy.budget(), Some(Duration::from_secs(1)), "cfg() configures 1s");
+
+        // And a later change is honoured on the very next call, with no cached copy to go stale.
+        assert!(r.patch_chain_transport(1, None, Some(25)));
+        r.get_balance(1, "0xabc").unwrap();
+        assert_eq!(spy.budget(), Some(Duration::from_secs(25)));
+    }
+
+    #[test]
+    fn an_unusable_verified_timeout_is_clamped_rather_than_honoured() {
+        assert_eq!(verified_budget(0), Duration::from_secs(1), "0 would time out instantly");
+        assert_eq!(verified_budget(9_999), Duration::from_secs(60));
+        assert_eq!(verified_budget(default_verified_timeout()), Duration::from_secs(15));
+    }
+
+    #[test]
     fn a_socks_proxy_and_verified_routing_cannot_both_be_required() {
         let mut r = EthRpc::new();
         let bad = ChainConfig {
@@ -718,6 +983,7 @@ mod verified_tests {
             proxy: Some("socks5h://127.0.0.1:9050".into()),
             proxy_required: true, timeout_secs: 8,
             verified_proxy_mode: VerifiedProxyMode::Required, verified_timeout_secs: 15,
+            source: ConfigSource::External,
         };
         assert!(bad.validate().is_err());
         assert!(r.set_chain_config(1, bad).is_err(), "the store must refuse the contradiction");
@@ -749,6 +1015,142 @@ mod verified_tests {
     }
 
     #[test]
+    fn patching_the_endpoint_leaves_the_verified_settings_a_whole_set_would_have_reset() {
+        let mut r = EthRpc::new();
+        let mut c = cfg(VerifiedProxyMode::Required);
+        c.endpoint = "https://old".into();
+        c.verified_timeout_secs = 20;
+        r.set_chain_config(1, c).unwrap();
+
+        assert!(r.patch_chain_endpoint(1, "  https://new  "));
+        let got = r.get_chain_config(1).unwrap();
+        assert_eq!(got.endpoint, "https://new", "trimmed and written");
+        assert_eq!(got.verified_proxy_mode, VerifiedProxyMode::Required, "set_chain_config resets this");
+        assert_eq!(got.verified_timeout_secs, 20);
+
+        // An absent chain is created with defaults rather than refused.
+        assert!(r.patch_chain_endpoint(42, "https://fresh"));
+        assert_eq!(r.get_chain_config(42).unwrap().verified_proxy_mode, VerifiedProxyMode::Off);
+        // An empty endpoint is not a way to blank one.
+        assert!(!r.patch_chain_endpoint(1, "   "));
+        assert_eq!(r.get_chain_config(1).unwrap().endpoint, "https://new");
+    }
+
+    /// The measured repro: the user enables verified mode for mainnet, and on the next app
+    /// start the sibling wallet pushes its own chain config — which predates verified routing
+    /// and carries no `verifiedProxyMode`. A whole-record write read that silence as "off",
+    /// and every later balance read went out in the clear with the UI honestly saying "off".
+    #[test]
+    fn a_sibling_wallet_omitting_verified_proxy_mode_does_not_turn_verified_mode_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chains.json");
+        {
+            let mut r = EthRpc::with_store(path.clone());
+            let mut c = cfg(VerifiedProxyMode::Required);
+            c.verified_timeout_secs = 20;
+            r.set_chain_config(1, c).unwrap();
+        }
+
+        // Verbatim from wallet-backend-module's `eth_rpc_config` (config.rs:130-138).
+        let sibling = r#"{"endpoint":"https://eth.llamarpc.com","proxy":null,
+                          "proxyRequired":false,"timeoutSecs":30}"#;
+        let mut r = EthRpc::with_store(path);
+        r.apply_chain_config(1, serde_json::from_str(sibling).unwrap()).unwrap();
+
+        let got = r.get_chain_config(1).unwrap();
+        assert_eq!(got.endpoint, "https://eth.llamarpc.com", "the sibling still owns the endpoint");
+        assert_eq!(got.timeout_secs, 30);
+        assert_eq!(got.verified_proxy_mode, VerifiedProxyMode::Required,
+                   "an omitted key must not revoke a security setting the user turned on");
+        assert_eq!(got.verified_timeout_secs, 20, "and neither may it reset the verified timeout");
+    }
+
+    #[test]
+    fn only_an_explicit_off_lowers_the_mode() {
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Required)).unwrap();
+        let wire = r#"{"endpoint":"https://x","verifiedProxyMode":"off","verifiedTimeoutSecs":9}"#;
+        r.apply_chain_config(1, serde_json::from_str(wire).unwrap()).unwrap();
+        let got = r.get_chain_config(1).unwrap();
+        assert_eq!(got.verified_proxy_mode, VerifiedProxyMode::Off, "an explicit off is honoured");
+        assert_eq!(got.verified_timeout_secs, 9);
+
+        // A brand-new chain has nothing to preserve, so the omitted fields take the defaults.
+        r.apply_chain_config(7, serde_json::from_str(r#"{"endpoint":"https://y"}"#).unwrap()).unwrap();
+        let fresh = r.get_chain_config(7).unwrap();
+        assert_eq!(fresh.verified_proxy_mode, VerifiedProxyMode::Off);
+        assert_eq!(fresh.verified_timeout_secs, default_verified_timeout());
+    }
+
+    #[test]
+    fn a_socks_requirement_arriving_later_is_refused_rather_than_dropping_the_mode() {
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Required)).unwrap();
+        let wire = r#"{"endpoint":"https://x","proxy":"socks5h://127.0.0.1:9050","proxyRequired":true}"#;
+        assert!(r.apply_chain_config(1, serde_json::from_str(wire).unwrap()).is_err(),
+                "resolving the contradiction silently is what dropped the mode before");
+        assert_eq!(r.get_chain_config(1).unwrap().verified_proxy_mode, VerifiedProxyMode::Required);
+    }
+
+    #[test]
+    fn the_route_label_separates_a_proven_read_from_a_forwarded_one() {
+        let r = verified_rpc(SpyRouter::ok(json!("0x1")));
+        assert_eq!(route_label(r.route_of(1, methods::GET_BALANCE)), "verified");
+        // A receipt and a fee figure come from the proxy's own execution provider, on trust.
+        assert_eq!(route_label(r.route_of(1, methods::GET_TRANSACTION_RECEIPT)), "proxied");
+        assert_eq!(route_label(r.route_of(1, methods::GAS_PRICE)), "proxied");
+
+        let mut off = EthRpc::new();
+        off.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap();
+        assert_eq!(route_label(off.route_of(1, methods::GET_BALANCE)), "direct");
+        assert_eq!(route_label(off.route_of(999, methods::GET_BALANCE)), "direct");
+    }
+
+    #[test]
+    fn the_route_a_caller_labels_with_is_the_one_the_call_actually_took() {
+        let r = verified_rpc(SpyRouter::ok(json!("0x1")));
+        for m in [methods::GET_BALANCE, methods::GAS_PRICE, methods::SEND_RAW_TRANSACTION] {
+            let (_, class) = r.rpc_call_routed(1, m, json!([])).unwrap();
+            assert_eq!(class, r.route_of(1, m), "{m}");
+        }
+    }
+
+    #[test]
+    fn the_url_escape_hatch_refuses_a_proof_backed_read_on_a_verified_chain() {
+        let spy = SpyRouter::ok(json!("0x1"));
+        let r = verified_rpc(spy.clone());
+        for m in [methods::GET_BALANCE, methods::CALL, methods::GET_TRANSACTION_COUNT,
+                  "eth_getCode", "eth_getStorageAt"] {
+            match r.rpc_call_url(1, "https://any-node.example", m, json!([])) {
+                Err(RpcError::VerifiedBypass(got)) => assert_eq!(got, m),
+                other => panic!("expected a refusal for {m}, got {other:?}"),
+            }
+        }
+        assert_eq!(spy.count(), 0, "refused outright — not quietly rerouted through the proxy");
+    }
+
+    #[test]
+    fn the_url_escape_hatch_still_submits_on_a_verified_chain() {
+        // railgun's only use: eth_sendUserOperation to a bundler. It is `Proxied` even on the
+        // verified leg, so refusing it would buy the guarantee nothing and break the caller.
+        // The url is dead on purpose: reaching a transport error proves the gate let it past.
+        let r = verified_rpc(SpyRouter::ok(json!("0x1")));
+        for m in ["eth_sendUserOperation", methods::SEND_RAW_TRANSACTION] {
+            match r.rpc_call_url(1, "http://127.0.0.1:1/bundler", m, json!([])) {
+                Err(RpcError::Http(_)) => {}
+                other => panic!("expected {m} to be attempted, got {other:?}"),
+            }
+        }
+        // And an `off` chain is unchanged: the hatch gates on the mode, not on the method.
+        let mut off = EthRpc::new();
+        off.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap();
+        match off.rpc_call_url(1, "http://127.0.0.1:1/x", methods::GET_BALANCE, json!([])) {
+            Err(RpcError::Http(_)) => {}
+            other => panic!("expected the call to be attempted, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn switching_mode_on_a_socks_required_chain_is_refused_and_rolled_back() {
         let mut r = EthRpc::new();
         let mut c = cfg(VerifiedProxyMode::Off);
@@ -758,5 +1160,204 @@ mod verified_tests {
         assert!(r.set_verified_proxy_mode(1, VerifiedProxyMode::Required).is_err());
         assert_eq!(r.get_chain_config(1).unwrap().verified_proxy_mode, VerifiedProxyMode::Off,
                    "a refused switch must not leave the mode changed");
+    }
+}
+
+/// The "ask, then initialize" convention: `config_status` reports, `init_defaults` seeds, and
+/// neither may lower a setting a user chose.
+#[cfg(test)]
+mod defaults_tests {
+    use super::*;
+
+    fn seeded_map(v: Vec<(u64, Vec<String>)>) -> HashMap<u64, Vec<String>> {
+        v.into_iter().collect()
+    }
+
+    fn snapshot(r: &EthRpc) -> String {
+        let m: std::collections::BTreeMap<u64, String> = r
+            .list_chains()
+            .into_iter()
+            .map(|id| (id, serde_json::to_string(r.get_chain_config(id).unwrap()).unwrap()))
+            .collect();
+        serde_json::to_string(&m).unwrap()
+    }
+
+    #[test]
+    fn the_shipped_defaults_cover_the_wallets_three_chains_with_verified_routing_off() {
+        let ids: Vec<u64> = DEFAULT_ENDPOINTS.iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, vec![1, 11155111, 560048]);
+        for &(_, url) in DEFAULT_ENDPOINTS {
+            let c = ChainConfig::builtin(url);
+            assert!(url.starts_with("https://"), "{url} must not be plaintext http");
+            assert_eq!(c.verified_proxy_mode, VerifiedProxyMode::Off,
+                       "verified routing needs an archive node the public defaults are not");
+            assert_eq!(c.source, ConfigSource::Builtin);
+            assert!(c.proxy.is_none() && !c.proxy_required);
+            c.validate().expect("a shipped default must be representable");
+        }
+    }
+
+    #[test]
+    fn initializing_twice_writes_nothing_the_second_time() {
+        let mut r = EthRpc::new();
+        let first = seeded_map(r.init_defaults());
+        for &(id, _) in DEFAULT_ENDPOINTS {
+            assert_eq!(first[&id], vec!["*".to_string()], "chain {id} should be seeded whole");
+        }
+        let after_first = snapshot(&r);
+
+        let second = seeded_map(r.init_defaults());
+        for &(id, _) in DEFAULT_ENDPOINTS {
+            assert!(second[&id].is_empty(), "chain {id} was rewritten by a second call");
+        }
+        assert_eq!(snapshot(&r), after_first, "a second init_defaults must not change a byte");
+    }
+
+    #[test]
+    fn initialization_is_still_a_no_op_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chains.json");
+        let stored = {
+            let mut r = EthRpc::with_store(path.clone());
+            r.init_defaults();
+            snapshot(&r)
+        };
+        // Idempotence has to survive a process lifetime, not just one instance.
+        let mut r = EthRpc::with_store(path);
+        assert!(seeded_map(r.init_defaults()).values().all(|f| f.is_empty()));
+        assert_eq!(snapshot(&r), stored);
+    }
+
+    #[test]
+    fn a_user_endpoint_and_verified_mode_survive_initialization() {
+        let mut r = EthRpc::new();
+        let mut mine = ChainConfig::builtin("https://my-own-archive.example");
+        mine.verified_proxy_mode = VerifiedProxyMode::Required;
+        mine.verified_timeout_secs = 42;
+        mine.timeout_secs = 3;
+        mine.source = ConfigSource::External;
+        r.set_chain_config(1, mine).unwrap();
+
+        let seeded = seeded_map(r.init_defaults());
+        assert!(seeded[&1].is_empty(), "a configured chain must not be touched");
+        assert_eq!(seeded[&11155111], vec!["*".to_string()], "the absent chains still get seeded");
+
+        let got = r.get_chain_config(1).unwrap();
+        assert_eq!(got.endpoint, "https://my-own-archive.example");
+        assert_eq!(got.verified_proxy_mode, VerifiedProxyMode::Required,
+                   "seeding a default must never revoke verified routing the user turned on");
+        assert_eq!((got.verified_timeout_secs, got.timeout_secs), (42, 3));
+        assert_eq!(got.source, ConfigSource::External);
+    }
+
+    #[test]
+    fn a_default_fills_an_absent_endpoint_without_touching_the_rest_of_the_record() {
+        let mut r = EthRpc::new();
+        let mut half = ChainConfig::builtin("");
+        half.proxy = Some("socks5h://127.0.0.1:9050".into());
+        half.proxy_required = true;
+        half.source = ConfigSource::External;
+        r.set_chain_config(11155111, half).unwrap();
+
+        let seeded = seeded_map(r.init_defaults());
+        assert_eq!(seeded[&11155111], vec!["endpoint".to_string()]);
+        let got = r.get_chain_config(11155111).unwrap();
+        assert_eq!(got.endpoint, "https://ethereum-sepolia-rpc.publicnode.com");
+        assert_eq!(got.proxy.as_deref(), Some("socks5h://127.0.0.1:9050"),
+                   "the fail-closed proxy policy is the user's, not ours to reset");
+        assert!(got.proxy_required);
+    }
+
+    #[test]
+    fn a_users_edit_relabels_a_defaulted_chain_as_theirs() {
+        let mut r = EthRpc::new();
+        r.init_defaults();
+        assert_eq!(r.get_chain_config(1).unwrap().source, ConfigSource::Builtin);
+
+        assert!(r.patch_chain_endpoint(1, "https://theirs.example"));
+        assert_eq!(r.get_chain_config(1).unwrap().source, ConfigSource::External);
+        // Every caller-facing write path promotes, so `default` can only ever mean untouched.
+        r.set_verified_proxy_mode(11155111, VerifiedProxyMode::Required).unwrap();
+        assert_eq!(r.get_chain_config(11155111).unwrap().source, ConfigSource::External);
+        assert!(r.patch_chain_transport(560048, Some(12), None));
+        assert_eq!(r.get_chain_config(560048).unwrap().source, ConfigSource::External);
+    }
+
+    #[test]
+    fn a_caller_cannot_declare_its_own_write_to_be_a_default() {
+        let mut r = EthRpc::new();
+        let wire = r#"{"endpoint":"https://theirs","source":"default"}"#;
+        r.apply_chain_config(1, serde_json::from_str(wire).unwrap()).unwrap();
+        assert_eq!(r.get_chain_config(1).unwrap().source, ConfigSource::External,
+                   "source is not on ChainConfigWire, so the key is ignored");
+        // And so init_defaults leaves the endpoint alone.
+        assert!(seeded_map(r.init_defaults())[&1].is_empty());
+        assert_eq!(r.get_chain_config(1).unwrap().endpoint, "https://theirs");
+
+        // The glue's ensure_chain_config path parses a bare ChainConfig, which DOES carry
+        // `source` so chains.json reads back — from_caller_json is what forces it.
+        let cfg = ChainConfig::from_caller_json(wire).unwrap();
+        assert_eq!(cfg.source, ConfigSource::External);
+        let mut g = EthRpc::new();
+        assert_eq!(g.ensure_chain_config(1, &cfg), vec!["*".to_string()]);
+        assert_eq!(g.get_chain_config(1).unwrap().source, ConfigSource::External);
+        // The point of `source`: config_status must not report a caller's record as built-in.
+        let s = g.config_status();
+        assert_eq!(s["chains"][0]["source"], json!("external"));
+        assert_eq!(s["source"], json!("external"));
+    }
+
+    #[test]
+    fn a_chains_json_written_before_source_existed_reads_back_as_external() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chains.json");
+        std::fs::write(&path, r#"{"1":{"endpoint":"https://legacy","timeoutSecs":30}}"#).unwrap();
+        // Fail closed: a record already on disk was written by somebody.
+        let r = EthRpc::with_store(path);
+        assert_eq!(r.get_chain_config(1).unwrap().source, ConfigSource::External);
+    }
+
+    #[test]
+    fn an_empty_store_reports_unconfigured_and_still_lists_what_it_could_seed() {
+        let s = EthRpc::new().config_status();
+        assert_eq!(s["ok"], json!(true));
+        assert_eq!(s["state"], json!("unconfigured"));
+        assert_eq!(s["source"], json!("none"));
+        let rows = s["chains"].as_array().unwrap();
+        assert_eq!(rows.len(), DEFAULT_ENDPOINTS.len());
+        assert_eq!(rows[0]["chainId"], json!(1));
+        assert_eq!(rows[0]["state"], json!("unconfigured"));
+        assert_eq!(rows[0]["source"], json!("none"));
+        assert!(rows[0].get("endpoint").is_none(), "no record means no endpoint to report");
+    }
+
+    #[test]
+    fn config_status_separates_a_default_from_a_value_the_user_chose() {
+        let mut r = EthRpc::new();
+        r.init_defaults();
+        let s = r.config_status();
+        assert_eq!((&s["state"], &s["source"]), (&json!("configured"), &json!("default")));
+        assert_eq!(s["chains"][0]["source"], json!("default"));
+        assert_eq!(s["chains"][0]["endpoint"], json!("https://ethereum-rpc.publicnode.com"));
+        assert_eq!(s["chains"][0]["verifiedProxyMode"], json!("off"));
+
+        assert!(r.patch_chain_endpoint(1, "https://theirs.example"));
+        let s = r.config_status();
+        assert_eq!(s["source"], json!("external"), "one external chain makes the roll-up external");
+        assert_eq!(s["chains"][0]["source"], json!("external"));
+        assert_eq!(s["chains"][1]["source"], json!("default"), "the others are unchanged");
+    }
+
+    #[test]
+    fn a_chain_outside_the_defaults_is_reported_but_never_seeded() {
+        let mut r = EthRpc::new();
+        r.set_chain_config(31337, ChainConfig::builtin("http://127.0.0.1:8545")).unwrap();
+        r.init_defaults();
+        let rows = r.config_status();
+        let rows = rows["chains"].as_array().unwrap();
+        assert_eq!(rows.len(), DEFAULT_ENDPOINTS.len() + 1);
+        assert_eq!(rows[1]["chainId"], json!(31337), "the union is sorted by chainId");
+        assert_eq!(rows[1]["state"], json!("configured"));
+        assert_eq!(r.get_chain_config(31337).unwrap().endpoint, "http://127.0.0.1:8545");
     }
 }
