@@ -34,6 +34,23 @@ fn verified_budget(secs: u64) -> Duration {
     Duration::from_secs(secs.clamp(1, 60))
 }
 
+/// Render a transport failure with its cause chain.
+///
+/// reqwest's `Display` names only the stage that failed, so a refused connection, an expired
+/// timeout and a dropped socket all read `error sending request for url (...)` and nothing else.
+/// That is the whole message a caller gets, and it cannot be acted on. Walking `source()` appends
+/// the reason the OS actually gave.
+fn http_error(e: reqwest::Error) -> RpcError {
+    use std::error::Error;
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(cause) = src {
+        s.push_str(&format!(": {cause}"));
+        src = cause.source();
+    }
+    RpcError::Http(s)
+}
+
 /// How JSON-RPC for a chain should be routed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -646,8 +663,8 @@ impl EthRpc {
         params: Value,
     ) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let resp = client.post(url).json(&body).send().map_err(|e| RpcError::Http(e.to_string()))?;
-        let v: Value = resp.json().map_err(|e| RpcError::Http(e.to_string()))?;
+        let resp = client.post(url).json(&body).send().map_err(http_error)?;
+        let v: Value = resp.json().map_err(http_error)?;
         if let Some(err) = v.get("error") {
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
             let message = err.get("message").and_then(Value::as_str).unwrap_or("").to_string();
@@ -826,6 +843,20 @@ mod tests {
         let mut r = EthRpc::new();
         r.set_chain_config(10, cfg(&url)).unwrap();
         assert_eq!(r.verify_chain_id(10).unwrap(), 10);
+    }
+
+    #[test]
+    fn a_transport_failure_names_its_cause_and_not_just_the_stage() {
+        // Nothing listens on port 1, so this fails at connect.
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg("http://127.0.0.1:1")).unwrap();
+        let err = r.verify_chain_id(1).unwrap_err().to_string();
+        assert!(err.starts_with("http: error sending request"), "got {err}");
+        // reqwest's own Display ends at the url, so everything past it is the cause chain.
+        // Without it a refused connection and an expired timeout are the same string, which is
+        // what made an unreachable node undiagnosable from a CI log.
+        let after_url = err.split_once(')').map(|(_, rest)| rest).unwrap_or("");
+        assert!(after_url.contains(':'), "no cause chain in {err}");
     }
 
     #[test]
