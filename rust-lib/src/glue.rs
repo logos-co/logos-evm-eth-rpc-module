@@ -25,8 +25,8 @@ use logos_rust_sdk::LogosModuleSDK;
 use serde_json::{json, Value};
 
 use crate::rpc::{
-    methods, route_label, ChainConfig, ChainConfigWire, EthRpc, VerifiedClass, VerifiedProxyMode,
-    VerifiedRouter,
+    diff_chain, methods, mode_label, route_label, ChainChange, ChainConfig, ChainConfigWire,
+    EthRpc, VerifiedClass, VerifiedProxyMode, VerifiedRouter,
 };
 use crate::verdict::{classify_readiness, GateCache, GateProbe, Readiness, Verdict, PROXY_MODULE};
 
@@ -96,6 +96,26 @@ pub trait EthRpcModule: Send + Sync + 'static {
     fn init_defaults(&self) -> String;
 
     fn on_context_ready(&self, _ctx: &RustModuleContext) {}
+}
+
+/// Typed events. Two, at two granularities, because there are two consumers.
+///
+/// `chain_config_changed` is the record for ONE chain — per chain and not per field, since a
+/// viewer redraws the whole row anyway, and not one global "something changed", which makes a
+/// three-chain consumer re-read all three for a change to one. It carries no config: this
+/// module is the single owner of that record, and a copy on the event plane is a second place
+/// it can go stale.
+///
+/// `verified_proxy_mode_changed` is the single field a wallet GATES on, carried inline so it
+/// learns the direction without a read-back. It is a refinement, not an alternative: a mode
+/// change emits both, so a consumer that only redraws config subscribes to one event.
+pub trait EthRpcModuleEvents {
+    /// One chain's stored record was added, removed, or altered. Re-read `get_chain_config`.
+    fn chain_config_changed(&self, chain_id: i64);
+    /// The verified-proxy gate for one chain moved. `mode` is the value now in force — `"off"`
+    /// or `"required"` — and a chain whose config was removed reports `"off"`, which is what
+    /// `verified_proxy_status` answers for it.
+    fn verified_proxy_mode_changed(&self, chain_id: i64, mode: String);
 }
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
@@ -219,33 +239,50 @@ impl EthRpcModuleImpl {
         }
     }
 
-    /// Run `f` against the initialized `EthRpc` under a WRITE lock (the two rare
-    /// config mutators). Returns `false` if context isn't ready.
-    /// Like `with_rpc_mut` but for methods answering `{ok,...}` rather than a bare bool — a
-    /// bool cannot say WHY, and every config method here can fail for a reason the caller needs.
-    fn with_rpc_mut_res(&self, f: impl FnOnce(&mut EthRpc) -> Value) -> String {
-        match self.rpc.write() {
-            Ok(mut g) => match g.as_mut() {
-                Some(rpc) => f(rpc).to_string(),
-                None => err("eth_rpc not initialized (context not ready)"),
-            },
-            Err(_) => err("eth_rpc lock poisoned"),
-        }
+    /// Run a config mutator under the WRITE lock and report what it actually moved. The
+    /// snapshot pair is taken inside the lock and diffed there; the guard drops on return, so
+    /// the emit in [`Self::settle`] happens with the new value already visible and on disk.
+    fn write_diffed<T>(&self, chain_id: i64, f: impl FnOnce(&mut EthRpc) -> T)
+        -> std::result::Result<(T, ChainChange), String>
+    {
+        let mut g = self.rpc.write().map_err(|_| "eth_rpc lock poisoned".to_string())?;
+        let rpc = g
+            .as_mut()
+            .ok_or_else(|| "eth_rpc not initialized (context not ready)".to_string())?;
+        let before = rpc.get_chain_config(chain_id as u64).cloned();
+        let out = f(rpc);
+        let change = diff_chain(before.as_ref(), rpc.get_chain_config(chain_id as u64));
+        Ok((out, change))
     }
 
-    /// A config mutator: run `f`, then drop the chain's memoized verdict and the host readiness
-    /// under it. Without this a user flipping the toggle, or retrying after loading the proxy,
-    /// is told about the previous answer for seconds.
-    fn mutate(&self, chain_id: i64, f: impl FnOnce(&mut EthRpc) -> Value) -> String {
-        let out = self.with_rpc_mut_res(f);
+    /// The tail every mutator shares: drop the chain's memoized verdict and the host readiness
+    /// under it (without this a user flipping the toggle is told about the previous answer for
+    /// seconds), then announce what moved — and only what moved.
+    fn settle<T>(&self, chain_id: i64, out: T, change: ChainChange) -> T {
         self.router.gate.invalidate(chain_id as u64);
+        if change.config {
+            emit_chain_config_changed(chain_id);
+        }
+        if let Some(m) = change.mode {
+            emit_verified_proxy_mode_changed(chain_id, mode_label(m));
+        }
         out
     }
 
-    fn with_rpc_mut(&self, f: impl FnOnce(&mut EthRpc) -> bool) -> bool {
-        match self.rpc.write().unwrap().as_mut() {
-            Some(rpc) => f(rpc),
-            None => false,
+    /// A config mutator answering `{ok,...}` rather than a bare bool — a bool cannot say WHY,
+    /// and every config method here can fail for a reason the caller needs.
+    fn mutate(&self, chain_id: i64, f: impl FnOnce(&mut EthRpc) -> Value) -> String {
+        match self.write_diffed(chain_id, f) {
+            Ok((v, change)) => self.settle(chain_id, v.to_string(), change),
+            Err(e) => err(e),
+        }
+    }
+
+    /// The same, for the two mutators whose contract is a bare bool.
+    fn mutate_bool(&self, chain_id: i64, f: impl FnOnce(&mut EthRpc) -> bool) -> bool {
+        match self.write_diffed(chain_id, f) {
+            Ok((ok, change)) => self.settle(chain_id, ok, change),
+            Err(_) => false,
         }
     }
 }
@@ -289,9 +326,7 @@ impl EthRpcModule for EthRpcModuleImpl {
             Ok(c) => c,
             Err(_) => return false,
         };
-        let ok = self.with_rpc_mut(|rpc| rpc.apply_chain_config(chain_id as u64, wire).is_ok());
-        self.router.gate.invalidate(chain_id as u64);
-        ok
+        self.mutate_bool(chain_id, |rpc| rpc.apply_chain_config(chain_id as u64, wire).is_ok())
     }
 
     fn get_chain_config(&self, chain_id: i64) -> String {
@@ -302,7 +337,7 @@ impl EthRpcModule for EthRpcModuleImpl {
     }
 
     fn remove_chain_config(&self, chain_id: i64) -> bool {
-        self.with_rpc_mut(|rpc| rpc.remove_chain_config(chain_id as u64))
+        self.mutate_bool(chain_id, |rpc| rpc.remove_chain_config(chain_id as u64))
     }
 
     fn list_chains(&self) -> String {
@@ -504,12 +539,15 @@ impl EthRpcModule for EthRpcModuleImpl {
             }
         };
         // Same reason `mutate` does it: a memoized verdict for a chain we just seeded is stale.
+        // Seeding only ever fills an ABSENT field with a builtin record, whose mode is `off` —
+        // the value an unconfigured chain already reported — so the gate never moves here.
         let mut applied = false;
         let mut fields = serde_json::Map::new();
         for (id, written) in &seeded {
             if !written.is_empty() {
                 applied = true;
                 self.router.gate.invalidate(*id);
+                emit_chain_config_changed(*id as i64);
             }
             fields.insert(id.to_string(), json!(written));
         }

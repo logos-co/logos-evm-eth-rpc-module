@@ -66,7 +66,7 @@ pub enum ConfigSource {
 /// Per-chain configuration. `endpoint` is the JSON-RPC URL; `proxy` /
 /// `proxy_required` drive the fail-closed client construction. JSON is
 /// camelCase (`proxyRequired`, `timeoutSecs`) to match the wallet backend.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainConfig {
     pub endpoint: String,
@@ -245,6 +245,40 @@ pub fn route_label(class: Option<VerifiedClass>) -> &'static str {
         Some(VerifiedClass::Proxied) => "proxied",
         None => "direct",
     }
+}
+
+/// The wire label for a chain's verified-proxy mode — what the `verified_proxy_mode_changed`
+/// event carries and what `set_verified_proxy_mode` accepts, spelled once.
+pub fn mode_label(mode: VerifiedProxyMode) -> &'static str {
+    match mode {
+        VerifiedProxyMode::Off => "off",
+        VerifiedProxyMode::Required => "required",
+    }
+}
+
+/// What a mutation actually moved. A setter that stores the same bytes must not wake every
+/// subscriber, so the emit decision is a diff of the record, never "a setter was called".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainChange {
+    /// The stored record differs — added, removed, or any field.
+    pub config: bool,
+    /// The verified-proxy gate moved, carrying the mode now in force.
+    pub mode: Option<VerifiedProxyMode>,
+}
+
+impl ChainChange {
+    pub fn any(&self) -> bool {
+        self.config || self.mode.is_some()
+    }
+}
+
+/// Diff one chain's record across a mutation. An ABSENT record reads as `off`, so removing a
+/// `required` chain reports the gate closing rather than reporting nothing — that is what a
+/// consumer observes through `verified_proxy_status`, which treats no config as off.
+pub fn diff_chain(before: Option<&ChainConfig>, after: Option<&ChainConfig>) -> ChainChange {
+    let mode_of = |c: Option<&ChainConfig>| c.map(|c| c.verified_proxy_mode).unwrap_or_default();
+    let (b, a) = (mode_of(before), mode_of(after));
+    ChainChange { config: before != after, mode: (b != a).then_some(a) }
 }
 
 /// The JSON-RPC method each typed helper issues. Named once so a caller can ask
@@ -1359,5 +1393,167 @@ mod defaults_tests {
         assert_eq!(rows[1]["chainId"], json!(31337), "the union is sorted by chainId");
         assert_eq!(rows[1]["state"], json!("configured"));
         assert_eq!(r.get_chain_config(31337).unwrap().endpoint, "http://127.0.0.1:8545");
+    }
+}
+
+/// The emit decision, exercised at the same seam the glue uses: snapshot, mutate, diff. Every
+/// case here is "a consumer is woken" or "a consumer is left alone".
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+
+    fn cfg(mode: VerifiedProxyMode) -> ChainConfig {
+        ChainConfig { endpoint: "https://mine".into(), proxy: None, proxy_required: false,
+            timeout_secs: 8, verified_proxy_mode: mode, verified_timeout_secs: 15,
+            source: ConfigSource::External }
+    }
+
+    /// What `EthRpcModuleImpl::write_diffed` does, minus the lock.
+    fn diff_of(r: &mut EthRpc, chain: u64, f: impl FnOnce(&mut EthRpc)) -> ChainChange {
+        let before = r.get_chain_config(chain).cloned();
+        f(r);
+        diff_chain(before.as_ref(), r.get_chain_config(chain))
+    }
+
+    #[test]
+    fn a_new_chain_reports_its_record_but_no_gate_move() {
+        let mut r = EthRpc::new();
+        let c = diff_of(&mut r, 1, |r| { r.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap(); });
+        assert_eq!(c, ChainChange { config: true, mode: None },
+                   "a chain arriving off was already effectively off");
+    }
+
+    #[test]
+    fn rewriting_the_same_record_reports_nothing() {
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap();
+        let c = diff_of(&mut r, 1, |r| { r.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap(); });
+        assert!(!c.any(), "an identical write must not wake every subscriber");
+    }
+
+    #[test]
+    fn a_sibling_rewriting_the_same_config_on_every_start_reports_nothing() {
+        let mut r = EthRpc::new();
+        let wire = r#"{"endpoint":"https://mine","proxyRequired":false,"timeoutSecs":8,
+                       "verifiedTimeoutSecs":15}"#;
+        r.apply_chain_config(1, serde_json::from_str(wire).unwrap()).unwrap();
+        let c = diff_of(&mut r, 1, |r| {
+            r.apply_chain_config(1, serde_json::from_str(wire).unwrap()).unwrap();
+        });
+        assert!(!c.any());
+    }
+
+    #[test]
+    fn turning_the_gate_on_reports_the_record_and_the_mode() {
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap();
+        let c = diff_of(&mut r, 1, |r| {
+            r.set_verified_proxy_mode(1, VerifiedProxyMode::Required).unwrap();
+        });
+        assert_eq!(c, ChainChange { config: true, mode: Some(VerifiedProxyMode::Required) });
+        assert_eq!(mode_label(c.mode.unwrap()), "required");
+    }
+
+    #[test]
+    fn setting_the_mode_to_what_it_already_is_reports_nothing() {
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Required)).unwrap();
+        let c = diff_of(&mut r, 1, |r| {
+            r.set_verified_proxy_mode(1, VerifiedProxyMode::Required).unwrap();
+        });
+        assert!(!c.any(), "the wallet polls this gate; a no-op set must not look like a flip");
+    }
+
+    #[test]
+    fn a_refused_mode_switch_reports_nothing() {
+        let mut r = EthRpc::new();
+        let mut c0 = cfg(VerifiedProxyMode::Off);
+        c0.proxy_required = true;
+        r.set_chain_config(1, c0).unwrap();
+        let c = diff_of(&mut r, 1, |r| {
+            assert!(r.set_verified_proxy_mode(1, VerifiedProxyMode::Required).is_err());
+        });
+        assert!(!c.any(), "a refusal changed nothing, so it announces nothing");
+    }
+
+    #[test]
+    fn removing_a_required_chain_closes_the_gate() {
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Required)).unwrap();
+        let c = diff_of(&mut r, 1, |r| { assert!(r.remove_chain_config(1)); });
+        assert_eq!(c, ChainChange { config: true, mode: Some(VerifiedProxyMode::Off) },
+                   "no config reads as off, and a consumer gating on required must hear it");
+    }
+
+    #[test]
+    fn removing_an_absent_chain_reports_nothing() {
+        let mut r = EthRpc::new();
+        let c = diff_of(&mut r, 7, |r| { assert!(!r.remove_chain_config(7)); });
+        assert!(!c.any());
+    }
+
+    #[test]
+    fn patching_an_endpoint_reports_the_record_only_when_it_moved() {
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Required)).unwrap();
+        let moved = diff_of(&mut r, 1, |r| { assert!(r.patch_chain_endpoint(1, "https://new")); });
+        assert_eq!(moved, ChainChange { config: true, mode: None },
+                   "an endpoint change does not move the gate");
+        let same = diff_of(&mut r, 1, |r| { assert!(r.patch_chain_endpoint(1, "  https://new  ")); });
+        assert!(!same.any(), "the trimmed value is what is stored, so this is a no-op");
+        let refused = diff_of(&mut r, 1, |r| { assert!(!r.patch_chain_endpoint(1, "   ")); });
+        assert!(!refused.any());
+    }
+
+    #[test]
+    fn patching_the_same_timeouts_reports_nothing() {
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap();
+        let same = diff_of(&mut r, 1, |r| { assert!(r.patch_chain_transport(1, Some(8), Some(15))); });
+        assert!(!same.any());
+        let moved = diff_of(&mut r, 1, |r| { assert!(r.patch_chain_transport(1, Some(9), None)); });
+        assert_eq!(moved, ChainChange { config: true, mode: None });
+    }
+
+    #[test]
+    fn ensure_reports_only_the_chain_it_actually_seeded() {
+        let mut r = EthRpc::new();
+        let mine = cfg(VerifiedProxyMode::Off);
+        let seeded = diff_of(&mut r, 1, |r| { assert!(!r.ensure_chain_config(1, &mine).is_empty()); });
+        assert_eq!(seeded, ChainChange { config: true, mode: None });
+        let again = diff_of(&mut r, 1, |r| { assert!(r.ensure_chain_config(1, &mine).is_empty()); });
+        assert!(!again.any());
+    }
+
+    /// `init_defaults` emits per chain off its own per-chain `seeded` list, so this asserts on
+    /// that list rather than on a diff.
+    #[test]
+    fn seeding_defaults_reports_each_chain_once_and_never_again() {
+        let mut r = EthRpc::new();
+        let first = r.init_defaults();
+        assert_eq!(first.iter().filter(|(_, w)| !w.is_empty()).count(), DEFAULT_ENDPOINTS.len());
+        let second = r.init_defaults();
+        assert!(second.iter().all(|(_, w)| w.is_empty()), "a second call announces nothing");
+        for &(id, _) in DEFAULT_ENDPOINTS {
+            assert_eq!(r.get_chain_config(id).unwrap().verified_proxy_mode, VerifiedProxyMode::Off,
+                       "seeding never moves the gate, so it emits no mode event");
+        }
+    }
+
+    #[test]
+    fn the_record_is_durable_before_the_change_is_decided() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chains.json");
+        let mut r = EthRpc::with_store(path.clone());
+        r.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap();
+
+        let before = r.get_chain_config(1).cloned();
+        r.set_verified_proxy_mode(1, VerifiedProxyMode::Required).unwrap();
+        // The glue emits here. Both the store and the on-disk file must already read the new
+        // value, or a subscriber calling straight back gets the one it was woken about.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let change = diff_chain(before.as_ref(), r.get_chain_config(1));
+        assert_eq!(change.mode, Some(VerifiedProxyMode::Required));
+        assert!(on_disk.contains("\"required\""), "persisted before the event is decided");
     }
 }

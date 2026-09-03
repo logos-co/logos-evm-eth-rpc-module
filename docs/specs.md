@@ -566,6 +566,55 @@ The field stays deserializable only so `chains.json` reads back.
 
 ---
 
+### 5.7 Events (`EthRpcModuleEvents`)
+
+Declared as the companion trait `EthRpcModuleEvents` in `src/glue.rs`; the builder derives the
+`.lidl` event declarations from it and generates the `emit_*` free functions.
+
+| event | payload | when |
+|---|---|---|
+| `chain_config_changed` | `chain_id: i64` | that chain's stored record was added, removed or altered |
+| `verified_proxy_mode_changed` | `chain_id: i64`, `mode: String` | the verified-proxy gate for that chain moved; `mode` is the value now in force (`"off"` / `"required"`) |
+
+**Granularity.** Per chain, not per field and not one global "something changed". A consumer
+redraws or re-reads a whole chain row anyway, so per-field events would only add noise; a
+single global event would make a three-chain consumer re-read all three because one moved.
+Neither event carries the config itself — this module is the single owner of that record, and
+a copy on the event plane is a second place it can go stale. `verified_proxy_mode_changed` is
+a **refinement** of `chain_config_changed`, not an alternative: a mode change emits both, so a
+consumer that only redraws configuration subscribes to one event and a wallet that only gates
+subscribes to the other. The mode is the one field carried inline, because it is the one a
+wallet branches on before deciding whether to ask anything else.
+
+**Which methods emit.** Every mutator, and only on a real change:
+
+| method | emits |
+|---|---|
+| `set_chain_config` | `chain_config_changed`; also the mode event when the wire moved the mode |
+| `remove_chain_config` | `chain_config_changed`; and `verified_proxy_mode_changed(id, "off")` when the removed chain was `required` |
+| `set_verified_proxy_mode` | both, on an accepted change |
+| `patch_chain_endpoint`, `patch_chain_transport`, `ensure_chain_config` | `chain_config_changed` |
+| `init_defaults` | `chain_config_changed` per chain it actually seeded |
+
+Every read method — `get_chain_config`, `list_chains`, `config_status`, `verified_proxy_status`
+and the RPC calls — is silent.
+
+**Two invariants, both tested (`rpc.rs`, `mod change_tests`):**
+
+1. *Emit only on an actual change.* The decision is `diff_chain(before, after)` over the stored
+   record, taken inside the write lock — never "a setter was called". A sibling wallet that
+   pushes the same config on every start, a `set_verified_proxy_mode` to the mode already in
+   force, a re-`patch` of the same endpoint, a refused switch, a second `init_defaults`: all
+   silent. Without this the wallet would be woken by the sibling's harmless startup write.
+2. *State before event.* The write lock is released before the emit, and the store persists
+   inside the mutator, so a subscriber calling straight back into `get_chain_config` or
+   `verified_proxy_status` reads the new value. Emitting under the lock would let a subscriber
+   read back the value it was just told had changed.
+
+An absent record counts as mode `off` on both sides of the diff — the same reading
+`verified_proxy_status` gives it — so removing a `required` chain closes the gate loudly, and
+seeding a fresh chain (whose builtin record is `off`) moves no gate and emits no mode event.
+
 ## 6. Configuration & data model
 
 ### 6.1 `ChainConfig` (`rpc.rs`)
