@@ -100,7 +100,7 @@ the round-trip is deterministic and offline.
 ### 3.1 Write the mock node
 
 ```
-import http.server, json
+import http.server, json, socketserver, time
 RES = {"eth_chainId": "0x1", "eth_getBalance": "0x1234", "eth_blockNumber": "0x10"}
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -113,11 +113,21 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
     def log_message(self, *a): pass
-# Threading, because eth_rpc_module is concurrency: "multi" and opens a fresh
-# connection per call: on the single-threaded server one slow or half-open
-# connection stalls every later request, which reads as an unreachable node.
-srv = http.server.ThreadingHTTPServer(('127.0.0.1', 8599), H)
-print('listening on %s:%d' % srv.server_address[:2], flush=True)
+# Threaded because eth_rpc_module is concurrency: "multi" and opens a fresh
+# connection per call, so the single-threaded server would serialise them.
+class Node(http.server.ThreadingHTTPServer):
+    # HTTPServer.server_bind() looks the host up in reverse DNS BETWEEN bind() and
+    # listen(), and nothing here needs the FQDN. Until that lookup answers the port
+    # is bound but not yet listening, so a caller's connect never completes; on a CI
+    # box whose resolver drops reverse queries for 127.0.0.1 that ran past 30s and
+    # read as an unreachable node.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+t0 = time.time()
+srv = Node(('127.0.0.1', 8599), H)
+host, port = srv.server_address[:2]
+print('listening on %s:%d after %.1fs' % (host, port, time.time() - t0), flush=True)
 srv.serve_forever()
 ```
 
