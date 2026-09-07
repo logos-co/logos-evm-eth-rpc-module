@@ -34,13 +34,38 @@ fn verified_budget(secs: u64) -> Duration {
     Duration::from_secs(secs.clamp(1, 60))
 }
 
+/// Below this a bound buys nothing — it cannot complete a handshake, and the protocol ABI
+/// refuses a sub-millisecond timeout rather than clamping it. A caller asking for less is
+/// REFUSED in words, never quietly given more than it asked for: a callee that outlives the
+/// caller which set the bound is the defect this whole parameter exists to close.
+const MIN_BUDGET: Duration = Duration::from_millis(50);
+
+/// The wall time a chain's `timeoutSecs` already permits, and so the most a caller's deadline
+/// may be widened to — it may only shorten this.
+///
+/// TWICE the configured value, because reqwest's BLOCKING client applies its client-level
+/// timeout as two independent timers — send-until-headers, then a fresh one for the body — and
+/// `post_rpc` does both. MEASURED: `ClientBuilder::timeout(1000ms)` against a node stalling
+/// 600ms on headers and 600ms on the body SUCCEEDS at 1.21s. `0` means reqwest's own 30s.
+fn configured_wall(timeout_secs: u64) -> Duration {
+    let per_phase = if timeout_secs == 0 { 30 } else { timeout_secs };
+    Duration::from_secs(per_phase.saturating_mul(2))
+}
+
+/// A caller's own wall budget for one call. `None`, or anything at or below zero, means "use
+/// this chain's configured timeout" — exactly what every caller got before the parameter
+/// existed, which is what keeps an un-rebuilt consumer working unchanged.
+pub fn caller_deadline(ms: Option<i64>) -> Option<Duration> {
+    ms.filter(|m| *m > 0).map(|m| Duration::from_millis(m as u64))
+}
+
 /// Render a transport failure with its cause chain.
 ///
 /// reqwest's `Display` names only the stage that failed, so a refused connection, an expired
 /// timeout and a dropped socket all read `error sending request for url (...)` and nothing else.
 /// That is the whole message a caller gets, and it cannot be acted on. Walking `source()` appends
 /// the reason the OS actually gave.
-fn http_error(e: reqwest::Error) -> RpcError {
+fn http_error(e: reqwest::Error, budget: Option<Duration>) -> RpcError {
     use std::error::Error;
     let mut s = e.to_string();
     let mut src = e.source();
@@ -48,7 +73,13 @@ fn http_error(e: reqwest::Error) -> RpcError {
         s.push_str(&format!(": {cause}"));
         src = cause.source();
     }
-    RpcError::Http(s)
+    // MEASURED: a HEADERS expiry reads "error sending request for url (...)" — word for word
+    // what a REFUSED connection reads — and a BODY expiry reads "error decoding response
+    // body", word for word what a malformed body reads. Only `is_timeout` tells them apart.
+    match (e.is_timeout(), budget) {
+        (true, Some(b)) => RpcError::Timeout { budget_ms: b.as_millis(), detail: s },
+        _ => RpcError::Http(s),
+    }
 }
 
 /// How JSON-RPC for a chain should be routed.
@@ -204,6 +235,9 @@ pub enum RpcError {
     UnknownChain(u64),
     Proxy(String),
     Http(String),
+    /// The budget ran out. Distinct from [`RpcError::Http`] because a caller retries a slow
+    /// endpoint and REPLACES a refused one, and reqwest reports both through one type.
+    Timeout { budget_ms: u128, detail: String },
     Rpc { code: i64, message: String },
     Parse(String),
     /// The verified path could not answer. NEVER downgraded to a direct call: a caller who
@@ -220,6 +254,9 @@ impl std::fmt::Display for RpcError {
             RpcError::UnknownChain(id) => write!(f, "no configuration for chain {id}"),
             RpcError::Proxy(e) => write!(f, "proxy: {e}"),
             RpcError::Http(e) => write!(f, "http: {e}"),
+            RpcError::Timeout { budget_ms, detail } => {
+                write!(f, "no answer within {budget_ms}ms: {detail}")
+            }
             RpcError::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
             RpcError::VerifiedProxy(e) => write!(f, "verified proxy: {e}"),
             RpcError::VerifiedBypass(m) => write!(
@@ -228,6 +265,24 @@ impl std::fmt::Display for RpcError {
                  explicit url, which cannot prove it (use raw_rpc)"
             ),
             RpcError::Parse(e) => write!(f, "parse: {e}"),
+        }
+    }
+}
+
+impl RpcError {
+    /// The machine discriminator. The RPC path was the last consumer-facing refusal on this
+    /// module without one, while `unready`, `config_status` and `verified_proxy_status` all
+    /// grew one so callers would stop matching on message text. `error` prose is unchanged.
+    pub fn code(&self) -> &'static str {
+        match self {
+            RpcError::UnknownChain(_) => "unknown_chain",
+            RpcError::Proxy(_) => "proxy",
+            RpcError::Http(_) => "http",
+            RpcError::Timeout { .. } => "timeout",
+            RpcError::Rpc { .. } => "rpc",
+            RpcError::Parse(_) => "parse",
+            RpcError::VerifiedProxy(_) => "verified_proxy",
+            RpcError::VerifiedBypass(_) => "verified_bypass",
         }
     }
 }
@@ -619,6 +674,19 @@ impl EthRpc {
     /// Returns the value and whether it is proof-backed, so a caller can report which it got
     /// rather than inferring it from the mode.
     pub fn rpc_call_routed(&self, chain_id: u64, method: &str, params: Value) -> Result<(Value, Option<VerifiedClass>)> {
+        self.rpc_call_routed_within(chain_id, method, params, None)
+    }
+
+    /// [`Self::rpc_call_routed`] bounded by the CALLER's own wall budget. It may only shorten
+    /// what the chain already permits, never lengthen it: `chains.json` is shared with other
+    /// wallets on this device, so a caller must not be able to widen its own exposure.
+    pub fn rpc_call_routed_within(
+        &self,
+        chain_id: u64,
+        method: &str,
+        params: Value,
+        deadline: Option<Duration>,
+    ) -> Result<(Value, Option<VerifiedClass>)> {
         let cfg = self.chains.get(&chain_id).ok_or(RpcError::UnknownChain(chain_id))?;
         if cfg.verified_proxy_mode == VerifiedProxyMode::Required {
             let router = self
@@ -626,15 +694,34 @@ impl EthRpc {
                 .as_ref()
                 .ok_or_else(|| RpcError::VerifiedProxy("no verified proxy is wired up".into()))?;
             let coerced = verified_params(method, &params);
+            let configured = verified_budget(cfg.verified_timeout_secs);
+            let budget = deadline.map_or(configured, |d| d.min(configured));
+            if budget < MIN_BUDGET {
+                return Err(RpcError::Timeout {
+                    budget_ms: budget.as_millis(),
+                    detail: "too little time left to ask the verified proxy".into(),
+                });
+            }
             // REFUSE on failure. Falling back would answer a request for a verified number
             // with an unverified one, which is worse than no answer at all.
             let v = router
-                .call(chain_id, method, &coerced, verified_budget(cfg.verified_timeout_secs))
+                .call(chain_id, method, &coerced, budget)
                 .map_err(RpcError::VerifiedProxy)?;
             return Ok((normalize_verified_result(v), Some(verified_class(method))));
         }
+        let bound = deadline.map(|d| d.min(configured_wall(cfg.timeout_secs)));
+        if let Some(b) = bound {
+            if b < MIN_BUDGET {
+                return Err(RpcError::Timeout {
+                    budget_ms: b.as_millis(),
+                    detail: format!("too little time left to ask chain {chain_id}"),
+                });
+            }
+        }
         let (client, endpoint) = self.client_for(chain_id)?;
-        Self::post_rpc(&client, &endpoint, method, params).map(|v| (v, None))
+        // `bound` is None on the untouched path, so the request carries no per-request timeout
+        // and the client-level one governs exactly as it did before this parameter existed.
+        Self::post_rpc(&client, &endpoint, method, params, bound).map(|v| (v, None))
     }
 
     /// Like [`Self::rpc_call`] but POSTs to an explicit `url` instead of the
@@ -652,19 +739,29 @@ impl EthRpc {
         }
         // Build the client from the chain's proxy config; ignore its endpoint.
         let (client, _endpoint) = self.client_for(chain_id)?;
-        Self::post_rpc(&client, url, method, params)
+        Self::post_rpc(&client, url, method, params, None)
     }
 
     /// POST a JSON-RPC request to `url` with `client` and unwrap the `result`.
+    /// `budget`, when given, is ONE total deadline across headers AND body — unlike the
+    /// client-level timeout, which arms a fresh timer for each phase. MEASURED against a node
+    /// stalling 600ms then 600ms: `RequestBuilder::timeout(1000ms)` fails at 1.004s where
+    /// `ClientBuilder::timeout(1000ms)` succeeds at 1.211s. So it is passed WHOLE — halving it
+    /// per phase, which reads like the obvious thing to do, would buy half what was asked for.
     fn post_rpc(
         client: &reqwest::blocking::Client,
         url: &str,
         method: &str,
         params: Value,
+        budget: Option<Duration>,
     ) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let resp = client.post(url).json(&body).send().map_err(http_error)?;
-        let v: Value = resp.json().map_err(http_error)?;
+        let mut req = client.post(url).json(&body);
+        if let Some(b) = budget {
+            req = req.timeout(b);
+        }
+        let resp = req.send().map_err(|e| http_error(e, budget))?;
+        let v: Value = resp.json().map_err(|e| http_error(e, budget))?;
         if let Some(err) = v.get("error") {
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
             let message = err.get("message").and_then(Value::as_str).unwrap_or("").to_string();
@@ -700,6 +797,18 @@ impl EthRpc {
     /// `eth_call`; `call` is a `{to, data, ...}` object (used for ERC20 reads).
     pub fn call(&self, chain_id: u64, call: Value) -> Result<String> {
         self.result_str(chain_id, methods::CALL, json!([call, "latest"]))
+    }
+
+    /// [`Self::call`] bounded by the caller's own wall budget. Additive rather than widening
+    /// the existing signature — the choice `raw_rpc_url` made beside `raw_rpc`.
+    pub fn call_within(&self, chain_id: u64, call: Value, deadline: Option<Duration>)
+        -> Result<String>
+    {
+        let (v, _) = self.rpc_call_routed_within(chain_id, methods::CALL, json!([call, "latest"]), deadline)?;
+        Ok(match v {
+            Value::String(s) => s,
+            other => other.to_string(),
+        })
     }
 
     pub fn get_transaction_count(&self, chain_id: u64, address: &str) -> Result<String> {
@@ -746,6 +855,79 @@ fn parse_hex_u64(s: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    // ── the caller's deadline ────────────────────────────────────────────────────────
+    //
+    // The defect these exist for: a wallet read under a 3s grant against the 8s socket
+    // timeout it had itself seeded, so it gave up ~5s before its own dependency would have
+    // and rendered a Debug blob where this module's sentence was about to arrive.
+
+    #[test]
+    fn no_deadline_means_exactly_what_every_caller_got_before_the_parameter_existed() {
+        // The whole compatibility story. An un-rebuilt consumer sends no slot at all and a
+        // rebuilt one that has no budget sends null; both must reach the same code path.
+        assert_eq!(caller_deadline(None), None);
+        assert_eq!(caller_deadline(Some(0)), None, "0 is how this stack spells `leave it`");
+        assert_eq!(caller_deadline(Some(-1)), None);
+        assert_eq!(caller_deadline(Some(2500)), Some(Duration::from_millis(2500)));
+    }
+
+    #[test]
+    fn a_caller_may_shorten_the_configured_bound_but_never_widen_it() {
+        // chains.json is shared with every other wallet on the device. A caller that could
+        // lengthen its own bound could hold this module's thread for as long as it liked.
+        let configured = configured_wall(8);
+        let shorter = Duration::from_millis(2_000);
+        let longer = Duration::from_secs(600);
+        assert_eq!(shorter.min(configured), shorter, "a shorter deadline wins");
+        assert_eq!(longer.min(configured), configured, "a longer one does not");
+    }
+
+    #[test]
+    fn the_configured_wall_is_twice_the_seconds_because_the_client_times_each_phase() {
+        // MEASURED, not inferred: ClientBuilder::timeout(1000ms) against a node stalling
+        // 600ms on headers and then 600ms on the body SUCCEEDS at 1.211s. A grant sized
+        // against the bare `timeoutSecs` would be half of what the endpoint may actually take.
+        assert_eq!(configured_wall(8), Duration::from_secs(16));
+        assert_eq!(configured_wall(0), Duration::from_secs(60), "0 is reqwest's own 30s default");
+    }
+
+    #[test]
+    fn a_deadline_too_small_to_buy_a_handshake_is_refused_rather_than_rounded_up() {
+        // Rounding UP would recreate the original defect in miniature: the callee outliving
+        // the caller that set the bound, and answering into a request nobody is waiting on.
+        assert!(Duration::from_millis(10) < MIN_BUDGET);
+        assert!(MIN_BUDGET <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_timeout_is_its_own_kind_because_a_caller_acts_differently_on_it() {
+        // reqwest reports both through one type, and the prose does not separate them: a
+        // body-phase expiry reads "error decoding response body" exactly like a malformed
+        // body, and a headers-phase expiry reads like a refused connection.
+        let slow = RpcError::Timeout { budget_ms: 3000, detail: "stalled".into() };
+        let down = RpcError::Http("error sending request for url (...)".into());
+        assert_eq!(slow.code(), "timeout");
+        assert_eq!(down.code(), "http");
+        assert!(slow.to_string().contains("3000ms"), "the budget is named: {slow}");
+    }
+
+    #[test]
+    fn every_refusal_carries_a_code_that_is_not_the_message() {
+        for e in [
+            RpcError::UnknownChain(1),
+            RpcError::Proxy("p".into()),
+            RpcError::Http("h".into()),
+            RpcError::Timeout { budget_ms: 1, detail: "d".into() },
+            RpcError::Rpc { code: -32000, message: "m".into() },
+            RpcError::Parse("p".into()),
+            RpcError::VerifiedProxy("v".into()),
+            RpcError::VerifiedBypass("b".into()),
+        ] {
+            assert!(!e.code().is_empty(), "{e} has no code");
+            assert!(!e.code().contains(' '), "a code is a token, not prose: {}", e.code());
+        }
+    }
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;

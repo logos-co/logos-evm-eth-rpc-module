@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::rpc::{
     diff_chain, methods, mode_label, route_label, ChainChange, ChainConfig, ChainConfigWire,
-    EthRpc, VerifiedClass, VerifiedProxyMode, VerifiedRouter,
+    EthRpc, VerifiedClass, VerifiedProxyMode, VerifiedRouter, RpcError,
 };
 use crate::verdict::{classify_readiness, GateCache, GateProbe, Readiness, Verdict, PROXY_MODULE};
 
@@ -45,7 +45,18 @@ pub trait EthRpcModule: Send + Sync + 'static {
     fn block_number(&self, chain_id: i64) -> String;
     fn get_balance(&self, chain_id: i64, address: String) -> String;
     /// `eth_call` — `call_json` is a `{ to, data }` object (ERC20 reads).
-    fn call(&self, chain_id: i64, call_json: String) -> String;
+    ///
+    /// `deadline_ms` is the CALLER's own wall budget for this call, measured from when this
+    /// module receives it. Absent or `0` leaves the chain's `timeoutSecs` in charge, so a
+    /// caller with no budget of its own is unchanged. A supplied value may only SHORTEN what
+    /// the chain already permits, never lengthen it: `chains.json` is shared with other
+    /// wallets on this device, and a caller must not be able to widen its own exposure.
+    ///
+    /// The rule, so the next method to take one is an instance rather than a second
+    /// exception: a method gains a deadline when the caller has a budget this module cannot
+    /// infer. `call` is that method — it is the read behind a wallet's balance screen, and a
+    /// caller racing it against a timeout it could neither set nor read is what this fixes.
+    fn call(&self, chain_id: i64, call_json: String, deadline_ms: Option<i64>) -> String;
     fn get_transaction_count(&self, chain_id: i64, address: String) -> String;
     fn gas_price(&self, chain_id: i64) -> String;
     fn fee_history(&self, chain_id: i64, blocks: i64, reward_percentiles_json: String) -> String;
@@ -138,6 +149,10 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 /// registry cannot answer.
 const PROBE_BUDGET: Duration = Duration::from_millis(1500);
 
+/// The least a proxy hop is worth attempting on. Below about a millisecond the SDK REFUSES the
+/// timeout rather than clamping it, and that refusal arrives as a Debug blob.
+const MIN_PROXY_HOP: Duration = Duration::from_millis(50);
+
 /// The modules_state budget, for both the readiness listing and the post-probe refinement. It
 /// is a local registry lookup, not a network hop.
 const MODULES_STATE_BUDGET: Duration = Duration::from_millis(750);
@@ -196,7 +211,9 @@ impl VerifiedRouter for VerifiedProxyRouter {
     fn call(&self, chain_id: u64, method: &str, params: &Value, budget: Duration)
         -> std::result::Result<Value, String>
     {
-        // The same cached verdict the UI polls gates the call: one probe serves both.
+        // The same cached verdict the UI polls gates the call: one probe serves both. It runs
+        // on its own constants and is never shortened — see `hop_budget`.
+        let t0 = std::time::Instant::now();
         let v = self.verdict(chain_id, true);
         if !v.usable {
             return Err(if v.detail.is_empty() {
@@ -205,8 +222,16 @@ impl VerifiedRouter for VerifiedProxyRouter {
                 format!("{} ({})", v.message, v.detail)
             });
         }
+        let Some(left) = crate::verdict::hop_budget(budget, t0.elapsed(), MIN_PROXY_HOP) else {
+            return Err(format!(
+                "the verified gate spent {}ms of a {}ms budget, leaving too little to ask the \
+                 proxy for {method}",
+                t0.elapsed().as_millis(),
+                budget.as_millis()
+            ));
+        };
         let raw = verified_proxy_module::VerifiedProxyModuleClient::new()
-            .rpc_with_timeout(method, params, budget)
+            .rpc_with_timeout(method, params, left)
             .map_err(|e| format!("{method} failed ({e:?})"))?;
 
         // `rpc` IS declared `-> result`, so this one DOES carry the envelope. The two methods
@@ -291,6 +316,14 @@ fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
 }
 
+/// An RPC refusal carrying `code` beside the prose, so a caller can tell "your deadline ran
+/// out" from "the endpoint is down" without matching on message text — which cannot be done:
+/// a body-phase expiry and a malformed body read identically. `error` is byte-unchanged,
+/// because `eth_rpc_ui` renders it verbatim.
+fn err_of(e: &RpcError) -> String {
+    json!({ "ok": false, "code": e.code(), "error": e.to_string() }).to_string()
+}
+
 /// The readiness refusal, carrying `state` so a consumer can tell "ask again in a moment" from
 /// "nothing is configured" without matching on the message. The message itself is unchanged:
 /// `eth_rpc_ui` renders it verbatim.
@@ -367,14 +400,21 @@ impl EthRpcModule for EthRpcModuleImpl {
         })
     }
 
-    fn call(&self, chain_id: i64, call_json: String) -> String {
+    fn call(&self, chain_id: i64, call_json: String, deadline_ms: Option<i64>) -> String {
+        // Before `with_rpc`: its read lock can queue behind a config mutator's write lock and
+        // that mutator's synchronous persist, which is time the caller is already spending.
+        let t0 = std::time::Instant::now();
+        let deadline = crate::rpc::caller_deadline(deadline_ms);
         let call = match parse_json(&call_json) {
             Ok(v) => v,
             Err(e) => return err(e),
         };
-        self.with_rpc(|rpc| match rpc.call(chain_id as u64, call) {
-            Ok(v) => ok_result(Value::String(v), rpc.route_of(chain_id as u64, methods::CALL)),
-            Err(e) => err(e),
+        self.with_rpc(|rpc| {
+            let left = deadline.map(|d| d.saturating_sub(t0.elapsed()));
+            match rpc.call_within(chain_id as u64, call.clone(), left) {
+                Ok(v) => ok_result(Value::String(v), rpc.route_of(chain_id as u64, methods::CALL)),
+                Err(e) => err_of(&e),
+            }
         })
     }
 

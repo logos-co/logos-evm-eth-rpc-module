@@ -11,10 +11,10 @@ mod proxy;
 mod rpc;
 mod verdict;
 
-pub use rpc::{diff_chain, methods, mode_label, route_label, ChainChange, ChainConfig,
+pub use rpc::{caller_deadline, diff_chain, methods, mode_label, route_label, ChainChange, ChainConfig,
               ChainConfigWire, ConfigSource, EthRpc, RpcError, VerifiedClass, VerifiedProxyMode,
               DEFAULT_ENDPOINTS};
-pub use verdict::{classify_modules_state, classify_readiness, classify_status, evaluate,
+pub use verdict::{classify_modules_state, hop_budget, classify_readiness, classify_status, evaluate,
                   evaluate_with, GateCache, GateProbe, Readiness, Verdict, HEALTH_TTL,
                   PROXY_MODULE, READY_TTL};
 
