@@ -272,6 +272,19 @@ pub const READY_TTL: Duration = Duration::from_secs(2);
 /// probe, short enough that a proxy falling over is noticed within seconds.
 pub const HEALTH_TTL: Duration = Duration::from_secs(5);
 
+/// What is left of a caller's budget once the gate has spent its own, or `None` when too
+/// little remains to be worth asking.
+///
+/// The gate runs on ITS OWN constants and is never shortened by a caller. A probe truncated
+/// to fit one caller's budget answers `Unknown`, and `verdict_at` then CACHES that for
+/// `HEALTH_TTL` and serves it to every other caller and to the UI's own poll — one impatient
+/// reader would turn verified routing off for everybody. So the gate is paid for OUT of the
+/// budget, not squeezed into it.
+pub fn hop_budget(budget: Duration, gate_spent: Duration, floor: Duration) -> Option<Duration> {
+    let left = budget.saturating_sub(gate_spent);
+    (left >= floor).then_some(left)
+}
+
 /// One verdict per chain and ONE readiness snapshot for the host.
 #[derive(Default)]
 pub struct GateCache {
@@ -341,6 +354,26 @@ impl GateCache {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_gate_is_paid_for_out_of_the_budget_rather_than_squeezed_into_it() {
+        let floor = Duration::from_millis(50);
+        assert_eq!(
+            hop_budget(Duration::from_millis(3000), Duration::from_millis(400), floor),
+            Some(Duration::from_millis(2600)),
+            "what the gate spent comes off the top"
+        );
+    }
+
+    #[test]
+    fn a_budget_the_gate_has_already_eaten_refuses_rather_than_asking_with_nothing_left() {
+        // Asking with 3ms left is how a truncated probe caches Unknown for HEALTH_TTL and
+        // turns verified routing off for every other reader, including the UI's own poll.
+        let floor = Duration::from_millis(50);
+        assert_eq!(hop_budget(Duration::from_millis(400), Duration::from_millis(397), floor), None);
+        assert_eq!(hop_budget(Duration::from_millis(10), Duration::from_secs(9), floor), None,
+                   "and an overspent gate saturates rather than wrapping");
+    }
     use super::*;
 
     /// A perfect snapshot, in the exact shape `ProxyRuntime::statusSnapshot()` emits.
