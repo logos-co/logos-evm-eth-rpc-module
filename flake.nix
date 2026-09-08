@@ -4,11 +4,14 @@
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
 
-    # Declared OPTIONAL in metadata.json: typed, but never loaded, bundled or built. It
-    # contributes only its published `packages.<system>.lidl` -- a single ~20 KB contract --
-    # so libverifproxy and the nimbus closure stay out of every consumer of this module. The
-    # follows keeps the generated ABI on one module-builder; without it the dependency drags
-    # its own and the skew segfaults inside provider init.
+    # Declared OPTIONAL in metadata.json: typed, but never loaded, bundled or built. Each
+    # contributes only its published `packages.<system>.lidl` -- verified_proxy_module's is a
+    # single 19,928-byte contract -- so libverifproxy and the nimbus closure stay out of every
+    # consumer of this module.
+    #
+    # The follows is for LOCK SIZE, not compatibility: without it each dependency drags its own
+    # module-builder subtree and this lock goes 756 -> 2250 nodes. The contract is unaffected
+    # either way -- measured byte-identical with and without.
     modules_state = {
       url = "github:logos-co/logos-modules-state-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
