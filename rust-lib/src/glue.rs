@@ -122,19 +122,18 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 
 // ── the verified leg ──────────────────────────────────────────────────────────────────
 //
-// Reached module-to-module but UNTYPED, and with no metadata.json dependency — deliberately.
-// Declaring verified_proxy_module as a real dependency makes collectAllModuleDeps resolve it
-// for every consumer of THIS module, dragging libverifproxy and the whole nimbus closure into
-// the multi-chain wallet, its doctests and ours, and taking the EVM stack off Windows until
-// nimbus' Nim requirement lands. An untyped call is the same hop without any of that, and
-// nothing typed is lost because this contract is JSON either way.
+// verified_proxy_module is an OPTIONAL dependency: typed, but never loaded, bundled or built.
+// It contributes only its published LIDL contract, so libverifproxy and the nimbus closure stay
+// out of every consumer of this module and the EVM stack keeps its Windows target. A required
+// dependency would drag all of it through collectAllModuleDeps.
 //
-// modules_state is called the same way and for the same reason: `dependencies` stays [] so no
-// consumer of this module inherits a closure just because the gate consults the host registry.
+// modules_state stays untyped for now — its ModuleRecord has a field named `type`, and the Rust
+// generator emits it unescaped, which will not compile. Same declaration once that is fixed.
 
-/// Bounded so an ABSENT proxy costs a second, not the 20s protocol deadline: an untyped call to
-/// an unloaded module blocks for the full default timeout, the async variant included. The
-/// readiness gate skips it outright; this bound covers what the registry cannot answer.
+/// Bounded so an ABSENT proxy costs a second, not the 20s protocol deadline: a call to an
+/// unloaded module blocks for the full default timeout, the async variant included, and being
+/// typed does not change that. The readiness gate skips it outright; this bound covers what the
+/// registry cannot answer.
 const PROBE_BUDGET: Duration = Duration::from_millis(1500);
 
 /// The modules_state budget, for both the readiness listing and the post-probe refinement. It
@@ -176,9 +175,8 @@ impl GateProbe for VerifiedProxyRouter {
     /// rather than a {success,value,error} envelope. Reading `value.state` here would silently
     /// see nothing and call every healthy proxy unusable.
     fn proxy_status(&self) -> std::result::Result<Value, String> {
-        LogosModuleSDK::new()
-            .plugin(PROXY_MODULE)
-            .call_json_with_timeout("status", &json!([]), PROBE_BUDGET)
+        verified_proxy_module::VerifiedProxyModuleClient::new()
+            .status_with_timeout(PROBE_BUDGET)
             .map_err(|e| format!("{e:?}"))
     }
 
@@ -204,9 +202,8 @@ impl VerifiedRouter for VerifiedProxyRouter {
                 format!("{} ({})", v.message, v.detail)
             });
         }
-        let raw = LogosModuleSDK::new()
-            .plugin(PROXY_MODULE)
-            .call_json_with_timeout("rpc", &json!([method, params]), budget)
+        let raw = verified_proxy_module::VerifiedProxyModuleClient::new()
+            .rpc_with_timeout(method, params, budget)
             .map_err(|e| format!("{method} failed ({e:?})"))?;
 
         // `rpc` IS declared `-> result`, so this one DOES carry the envelope. The two methods

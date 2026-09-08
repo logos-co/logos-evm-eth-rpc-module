@@ -3,6 +3,16 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+
+    # Declared OPTIONAL in metadata.json: typed, but never loaded, bundled or built. It
+    # contributes only its published `packages.<system>.lidl` -- a single ~20 KB contract --
+    # so libverifproxy and the nimbus closure stay out of every consumer of this module. The
+    # follows keeps the generated ABI on one module-builder; without it the dependency drags
+    # its own and the skew segfaults inside provider init.
+    verified_proxy_module = {
+      url = "github:logos-co/logos-verified-proxy-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
