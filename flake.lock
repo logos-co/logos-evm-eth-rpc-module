@@ -3098,11 +3098,11 @@
         "rust-overlay": "rust-overlay_4"
       },
       "locked": {
-        "lastModified": 1788897233,
-        "narHash": "sha256-E7Pz2qSKddt4N15RezxKkcQTDvvbUTDSc5P0+oSovdA=",
+        "lastModified": 1788907215,
+        "narHash": "sha256-lIxC6adtRUkfrfWiP/KZF8UYiUf04KaknT/fvPCwq6c=",
         "owner": "logos-co",
         "repo": "logos-module-builder",
-        "rev": "9f420c2901e35a16ba8fc77383e796480000a1d2",
+        "rev": "e1a25706edb50aa7f34d02e08262ae7ffb3cb8db",
         "type": "github"
       },
       "original": {
@@ -10657,11 +10657,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1788888630,
-        "narHash": "sha256-ibEdGIrfycCQQFNaBrROaHJ1D30n2x2D2tIJSva1CgM=",
+        "lastModified": 1788901921,
+        "narHash": "sha256-K+Iwz88UK2i7O00fpdw51CPV4a77zj8XmPspihp3fPc=",
         "owner": "logos-co",
         "repo": "logos-rust-sdk",
-        "rev": "102f86779b010f5bc2e845cf91bb3583e87dcc0c",
+        "rev": "f46f40edc2b4bb1e8a142f27fa0ec57e2c46b87a",
         "type": "github"
       },
       "original": {
@@ -11347,6 +11347,26 @@
       "original": {
         "owner": "logos-co",
         "repo": "logos-view-module",
+        "type": "github"
+      }
+    },
+    "modules_state": {
+      "inputs": {
+        "logos-module-builder": [
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788383488,
+        "narHash": "sha256-s/XG+4RyX6djnqMvdegdjygPz/n9/o6Da0Zo7vBangk=",
+        "owner": "logos-co",
+        "repo": "logos-modules-state-module",
+        "rev": "dc13caa80164f2a941f788f4f96af193cd019879",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-modules-state-module",
         "type": "github"
       }
     },
@@ -17962,6 +17982,7 @@
     "root": {
       "inputs": {
         "logos-module-builder": "logos-module-builder",
+        "modules_state": "modules_state",
         "verified_proxy_module": "verified_proxy_module"
       }
     },

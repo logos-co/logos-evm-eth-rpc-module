@@ -9,6 +9,10 @@
     # so libverifproxy and the nimbus closure stay out of every consumer of this module. The
     # follows keeps the generated ABI on one module-builder; without it the dependency drags
     # its own and the skew segfaults inside provider init.
+    modules_state = {
+      url = "github:logos-co/logos-modules-state-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
     verified_proxy_module = {
       url = "github:logos-co/logos-verified-proxy-module";
       inputs.logos-module-builder.follows = "logos-module-builder";

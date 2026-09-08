@@ -127,8 +127,10 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 // out of every consumer of this module and the EVM stack keeps its Windows target. A required
 // dependency would drag all of it through collectAllModuleDeps.
 //
-// modules_state stays untyped for now — its ModuleRecord has a field named `type`, and the Rust
-// generator emits it unescaped, which will not compile. Same declaration once that is fixed.
+// modules_state is declared the same way, and for the same reason: the gate consults the host
+// registry for PRESENCE, which is where presence detection belongs — there is no presence API,
+// by design. Its records reach the classifier as JSON because verdict.rs is deliberately free of
+// the Logos runtime and cannot see the generated types.
 
 /// Bounded so an ABSENT proxy costs a second, not the 20s protocol deadline: a call to an
 /// unloaded module blocks for the full default timeout, the async variant included, and being
@@ -164,10 +166,10 @@ impl GateProbe for VerifiedProxyRouter {
     /// not `is_ready`: a bool cannot separate "not loaded" from "the registry has nothing to
     /// say", and only the listing carries `partial`.
     fn readiness(&self) -> Readiness {
-        let listing = LogosModuleSDK::new()
-            .plugin("modules_state")
-            .call_json_with_timeout("list_modules", &json!([]), MODULES_STATE_BUDGET)
-            .ok();
+        let listing = modules_state::ModulesStateClient::new()
+            .list_modules_with_timeout(MODULES_STATE_BUDGET)
+            .ok()
+            .map(|l| l.to_json());
         classify_readiness(listing.as_ref())
     }
 
@@ -182,10 +184,11 @@ impl GateProbe for VerifiedProxyRouter {
 
     /// Only ever after a failed probe, where it can sharpen the reason but never veto.
     fn module_record(&self) -> Option<Value> {
-        LogosModuleSDK::new()
-            .plugin("modules_state")
-            .call_json_with_timeout("module_record", &json!([PROXY_MODULE]), MODULES_STATE_BUDGET)
+        modules_state::ModulesStateClient::new()
+            .module_record_with_timeout(PROXY_MODULE, MODULES_STATE_BUDGET)
             .ok()
+            .flatten()
+            .map(|r| r.to_json())
     }
 }
 
