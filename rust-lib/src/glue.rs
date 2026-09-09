@@ -133,10 +133,15 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 
 // ── the verified leg ──────────────────────────────────────────────────────────────────
 //
-// verified_proxy_module is an OPTIONAL dependency: typed, but never loaded, bundled or built.
-// It contributes only its published LIDL contract, so libverifproxy and the nimbus closure stay
-// out of every consumer of this module and the EVM stack keeps its Windows target. A required
-// dependency would drag all of it through collectAllModuleDeps.
+// verified_proxy_module is an OPTIONAL dependency: typed, and tolerated when absent. The load
+// hook reports it as `optional_skipped` and this module comes up anyway, which is the whole
+// point -- the verified leg is a feature, not a precondition.
+//
+// NOT for closure reasons, despite what this comment used to claim. Measured both ways: with
+// verified_proxy_module declared REQUIRED, this module's closure still holds 0 nimbus paths and
+// `.#install` still stages only eth_rpc_module. A module dependency is consumed as its published
+// LIDL contract either way; what would actually pull libverifproxy in is an `external_libraries`
+// entry, which is why that repo needs a Windows build of nimbus and its consumers do not.
 //
 // modules_state is declared the same way, and for the same reason: the gate consults the host
 // registry for PRESENCE, which is where presence detection belongs — there is no presence API,
