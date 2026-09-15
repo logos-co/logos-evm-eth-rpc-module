@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::rpc::{
     diff_chain, methods, mode_label, route_label, ChainChange, ChainConfig, ChainConfigWire,
-    EthRpc, VerifiedClass, VerifiedProxyMode, VerifiedRouter, RpcError,
+    EthRpc, NetworkScope, RouterError, VerifiedClass, VerifiedProxyMode, VerifiedRouter, RpcError,
 };
 use crate::verdict::{classify_readiness, GateCache, GateProbe, Readiness, Verdict, PROXY_MODULE};
 
@@ -39,6 +39,13 @@ pub trait EthRpcModule: Send + Sync + 'static {
     fn remove_chain_config(&self, chain_id: i64) -> bool;
     /// `{ ok, chains: [chainId, ...] }`.
     fn list_chains(&self) -> String;
+    /// The chain registry, including metadata, enabled state and device-wide scope.
+    fn list_chain_configs(&self) -> String;
+    fn set_chain_enabled(&self, chain_id: i64, enabled: bool) -> String;
+    /// Patch name/nativeSymbol/nativeDecimals/testnet. Omitted keeps; explicit null clears.
+    fn patch_chain_metadata(&self, chain_id: i64, metadata_json: String) -> String;
+    fn get_network_scope(&self) -> String;
+    fn set_network_scope(&self, scope: String) -> String;
 
     /// `eth_chainId` round-trip → `{ ok, chainId }`.
     fn verify_chain_id(&self, chain_id: i64) -> String;
@@ -123,6 +130,8 @@ pub trait EthRpcModule: Send + Sync + 'static {
 pub trait EthRpcModuleEvents {
     /// One chain's stored record was added, removed, or altered. Re-read `get_chain_config`.
     fn chain_config_changed(&self, chain_id: i64);
+    fn chain_enabled_changed(&self, chain_id: i64, enabled: bool);
+    fn network_scope_changed(&self, scope: String);
     /// The verified-proxy gate for one chain moved. `mode` is the value now in force — `"off"`
     /// or `"required"` — and a chain whose config was removed reports `"off"`, which is what
     /// `verified_proxy_status` answers for it.
@@ -214,36 +223,32 @@ impl GateProbe for VerifiedProxyRouter {
 
 impl VerifiedRouter for VerifiedProxyRouter {
     fn call(&self, chain_id: u64, method: &str, params: &Value, budget: Duration)
-        -> std::result::Result<Value, String>
+        -> std::result::Result<Value, RouterError>
     {
         // The same cached verdict the UI polls gates the call: one probe serves both. It runs
         // on its own constants and is never shortened — see `hop_budget`.
         let t0 = std::time::Instant::now();
         let v = self.verdict(chain_id, true);
         if !v.usable {
-            return Err(if v.detail.is_empty() {
-                v.message
-            } else {
-                format!("{} ({})", v.message, v.detail)
-            });
+            return Err(RouterError::Blocked(v));
         }
         let Some(left) = crate::verdict::hop_budget(budget, t0.elapsed(), MIN_PROXY_HOP) else {
-            return Err(format!(
+            return Err(RouterError::Failed(format!(
                 "the verified gate spent {}ms of a {}ms budget, leaving too little to ask the \
                  proxy for {method}",
                 t0.elapsed().as_millis(),
                 budget.as_millis()
-            ));
+            )));
         };
         let raw = verified_proxy_module::VerifiedProxyModuleClient::new()
             .rpc_with_timeout(method, params, left)
-            .map_err(|e| format!("{method} failed ({e:?})"))?;
+            .map_err(|e| RouterError::Failed(format!("{method} failed ({e:?})")))?;
 
         // `rpc` IS declared `-> result`, so this one DOES carry the envelope. The two methods
         // differ, and the SDK unwraps neither.
         if raw.get("success").and_then(Value::as_bool) != Some(true) {
             let why = raw.get("error").and_then(Value::as_str).unwrap_or("no detail");
-            return Err(format!("{method}: {why}"));
+            return Err(RouterError::Failed(format!("{method}: {why}")));
         }
         Ok(raw.get("value").cloned().unwrap_or(Value::Null))
     }
@@ -296,6 +301,9 @@ impl EthRpcModuleImpl {
         if let Some(m) = change.mode {
             emit_verified_proxy_mode_changed(chain_id, mode_label(m));
         }
+        if let Some(enabled) = change.enabled {
+            emit_chain_enabled_changed(chain_id, enabled);
+        }
         out
     }
 
@@ -326,7 +334,18 @@ fn err(e: impl std::fmt::Display) -> String {
 /// a body-phase expiry and a malformed body read identically. `error` is byte-unchanged,
 /// because `eth_rpc_ui` renders it verbatim.
 fn err_of(e: &RpcError) -> String {
-    json!({ "ok": false, "code": e.code(), "error": e.to_string() }).to_string()
+    match e {
+        RpcError::VerifiedBlocked { chain_id, verdict } => json!({
+            "ok": false,
+            "code": e.code(),
+            "blocked": true,
+            "chainId": chain_id,
+            "error": e.to_string(),
+            "verifiedProxy": verdict.to_json(*chain_id as i64, true),
+        })
+        .to_string(),
+        _ => json!({ "ok": false, "code": e.code(), "error": e.to_string() }).to_string(),
+    }
 }
 
 /// The readiness refusal, carrying `state` so a consumer can tell "ask again in a moment" from
@@ -382,26 +401,84 @@ impl EthRpcModule for EthRpcModuleImpl {
         self.with_rpc(|rpc| json!({ "ok": true, "chains": rpc.list_chains() }).to_string())
     }
 
+    fn list_chain_configs(&self) -> String {
+        self.with_rpc(|rpc| rpc.list_chain_configs().to_string())
+    }
+
+    fn set_chain_enabled(&self, chain_id: i64, enabled: bool) -> String {
+        self.mutate(chain_id, |rpc| match rpc.set_chain_enabled(chain_id as u64, enabled) {
+            Ok(_) => json!({ "ok": true, "chainId": chain_id, "enabled": enabled }),
+            Err(error) => json!({ "ok": false, "code": "unknown_chain", "error": error }),
+        })
+    }
+
+    fn patch_chain_metadata(&self, chain_id: i64, metadata_json: String) -> String {
+        let patch = match parse_json(&metadata_json) {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        self.mutate(chain_id, |rpc| match rpc.patch_chain_metadata(chain_id as u64, &patch) {
+            Ok(()) => json!({
+                "ok": true,
+                "chainId": chain_id,
+                "config": rpc.get_chain_config(chain_id as u64),
+            }),
+            Err(error) => json!({ "ok": false, "code": "bad_metadata", "error": error }),
+        })
+    }
+
+    fn get_network_scope(&self) -> String {
+        self.with_rpc(|rpc| json!({ "ok": true, "scope": rpc.network_scope() }).to_string())
+    }
+
+    fn set_network_scope(&self, scope: String) -> String {
+        let parsed = match scope.trim().to_ascii_lowercase().as_str() {
+            "mainnets" => NetworkScope::Mainnets,
+            "testnets" => NetworkScope::Testnets,
+            "both" => NetworkScope::Both,
+            other => return json!({
+                "ok": false,
+                "code": "bad_scope",
+                "error": format!("unknown network scope '{other}' (expected mainnets, testnets or both)"),
+            })
+            .to_string(),
+        };
+        let changed = {
+            let mut guard = match self.rpc.write() {
+                Ok(guard) => guard,
+                Err(_) => return err("eth_rpc lock poisoned"),
+            };
+            match guard.as_mut() {
+                Some(rpc) => rpc.set_network_scope(parsed),
+                None => return unready(),
+            }
+        };
+        if changed {
+            emit_network_scope_changed(parsed.label());
+        }
+        json!({ "ok": true, "scope": parsed }).to_string()
+    }
+
     fn verify_chain_id(&self, chain_id: i64) -> String {
         self.with_rpc(|rpc| match rpc.verify_chain_id(chain_id as u64) {
             Ok(id) => json!({ "ok": true, "chainId": id,
                               "route": route_label(rpc.route_of(chain_id as u64, methods::CHAIN_ID)) })
                 .to_string(),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
     fn block_number(&self, chain_id: i64) -> String {
         self.with_rpc(|rpc| match rpc.block_number(chain_id as u64) {
             Ok(v) => ok_result(Value::String(v), rpc.route_of(chain_id as u64, methods::BLOCK_NUMBER)),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
     fn get_balance(&self, chain_id: i64, address: String) -> String {
         self.with_rpc(|rpc| match rpc.get_balance(chain_id as u64, &address) {
             Ok(v) => ok_result(Value::String(v), rpc.route_of(chain_id as u64, methods::GET_BALANCE)),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
@@ -427,14 +504,14 @@ impl EthRpcModule for EthRpcModuleImpl {
         self.with_rpc(|rpc| match rpc.get_transaction_count(chain_id as u64, &address) {
             Ok(v) => ok_result(Value::String(v),
                                rpc.route_of(chain_id as u64, methods::GET_TRANSACTION_COUNT)),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
     fn gas_price(&self, chain_id: i64) -> String {
         self.with_rpc(|rpc| match rpc.gas_price(chain_id as u64) {
             Ok(v) => ok_result(Value::String(v), rpc.route_of(chain_id as u64, methods::GAS_PRICE)),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
@@ -445,7 +522,7 @@ impl EthRpcModule for EthRpcModuleImpl {
         };
         self.with_rpc(|rpc| match rpc.fee_history(chain_id as u64, blocks.max(0) as u64, pct) {
             Ok(v) => ok_result(v, rpc.route_of(chain_id as u64, methods::FEE_HISTORY)),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
@@ -456,7 +533,7 @@ impl EthRpcModule for EthRpcModuleImpl {
         };
         self.with_rpc(|rpc| match rpc.estimate_gas(chain_id as u64, tx) {
             Ok(v) => ok_result(Value::String(v), rpc.route_of(chain_id as u64, methods::ESTIMATE_GAS)),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
@@ -466,21 +543,21 @@ impl EthRpcModule for EthRpcModuleImpl {
                              "route": route_label(rpc.route_of(chain_id as u64,
                                                                methods::SEND_RAW_TRANSACTION)) })
                 .to_string(),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
     fn get_transaction_receipt(&self, chain_id: i64, hash_hex: String) -> String {
         self.with_rpc(|rpc| match rpc.get_transaction_receipt(chain_id as u64, &hash_hex) {
             Ok(v) => ok_result(v, rpc.route_of(chain_id as u64, methods::GET_TRANSACTION_RECEIPT)),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
     fn get_transaction_by_hash(&self, chain_id: i64, hash_hex: String) -> String {
         self.with_rpc(|rpc| match rpc.get_transaction_by_hash(chain_id as u64, &hash_hex) {
             Ok(v) => ok_result(v, rpc.route_of(chain_id as u64, methods::GET_TRANSACTION_BY_HASH)),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
@@ -491,7 +568,7 @@ impl EthRpcModule for EthRpcModuleImpl {
         };
         self.with_rpc(|rpc| match rpc.rpc_call(chain_id as u64, &method, params) {
             Ok(v) => ok_result(v, rpc.route_of(chain_id as u64, &method)),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 
@@ -593,6 +670,9 @@ impl EthRpcModule for EthRpcModuleImpl {
                 applied = true;
                 self.router.gate.invalidate(*id);
                 emit_chain_config_changed(*id as i64);
+                if written.len() == 1 && written[0] == "*" {
+                    emit_chain_enabled_changed(*id as i64, true);
+                }
             }
             fields.insert(id.to_string(), json!(written));
         }
@@ -608,7 +688,7 @@ impl EthRpcModule for EthRpcModuleImpl {
         // the chain's mode would call a bundler's answer "proxied" when nothing proxied it.
         self.with_rpc(|rpc| match rpc.rpc_call_url(chain_id as u64, &url, &method, params) {
             Ok(v) => ok_result(v, None),
-            Err(e) => err(e),
+            Err(e) => err_of(&e),
         })
     }
 }

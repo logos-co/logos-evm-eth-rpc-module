@@ -1,7 +1,8 @@
 # logos-evm-eth-rpc-module
 
-A Logos `core` module (Rust, rust-first cdylib): a **proxyable, fail-closed
-Ethereum JSON-RPC client** for the Logos multi-chain EVM wallet.
+A Logos `core` module (Rust, rust-first cdylib): the device-wide EVM chain
+registry and a **proxyable, fail-closed Ethereum JSON-RPC client** for every
+wallet and dapp on the device.
 
 It stores configuration **per chain** (endpoint + proxy policy), so callers route
 by `chainId` alone. Every outbound request is built through a single fail-closed
@@ -12,8 +13,11 @@ proxy — Tor-ready).
 
 ## Contract (`EthRpcModule`)
 
-Config: `set_chain_config(chainId, {endpoint, proxy?, proxyRequired?, timeoutSecs?})`,
-`get_chain_config`, `remove_chain_config`, `list_chains`. Calls keyed by chainId:
+Registry: `list_chain_configs`, `set_chain_enabled`, `patch_chain_metadata`,
+`get_network_scope`, `set_network_scope`. Config:
+`set_chain_config(chainId, {endpoint, proxy?, proxyRequired?, timeoutSecs?, enabled?,
+name?, nativeSymbol?, nativeDecimals?, testnet?})`, `get_chain_config`,
+`remove_chain_config`, `list_chains`. Calls keyed by chainId:
 `verify_chain_id`, `block_number`, `get_balance`, `call`, `get_transaction_count`,
 `gas_price`, `fee_history`, `estimate_gas`, `send_raw_transaction`,
 `get_transaction_receipt`, `get_transaction_by_hash`, `raw_rpc`.
@@ -23,6 +27,8 @@ Config: `set_chain_config(chainId, {endpoint, proxy?, proxyRequired?, timeoutSec
 | event | when |
 |---|---|
 | `chain_config_changed(chainId)` | that chain's stored record was added, removed or altered |
+| `chain_enabled_changed(chainId, enabled)` | the chain's device-wide enabled state moved |
+| `network_scope_changed(scope)` | the device-wide scope moved among `mainnets`, `testnets`, and `both` |
 | `verified_proxy_mode_changed(chainId, mode)` | the verified-proxy gate for that chain moved; `mode` is `"off"` or `"required"`, the value now in force |
 
 **Every method that changes persisted state emits; every reader is silent; and a
@@ -48,16 +54,19 @@ Removing a chain's config reports `"off"`: no configuration is what
 
 ## Working with no configuration at all
 
-The module ships defaults, so a consumer needs no UI app installed to work. Ask
+The module ships defaults, so a consumer needs no UI app installed to work. All
+three start enabled and the fresh-device scope is `mainnets`. A chain is in scope
+only when it is enabled and its `testnet` classification matches the scope;
+unknown classifications are included only by `both`. Ask
 `config_status()` — `{ ok, state, source, chains }`, where `state` is `unready`
 (context not ready — ask again), `unconfigured`, or `configured` — then call
 `init_defaults()`, which seeds these per chain and per **field**, only where absent:
 
-| Chain | id | Endpoint |
-|---|---|---|
-| Ethereum | `1` | `https://ethereum-rpc.publicnode.com` |
-| Sepolia | `11155111` | `https://ethereum-sepolia-rpc.publicnode.com` |
-| Hoodi | `560048` | `https://ethereum-hoodi-rpc.publicnode.com` |
+| Chain | id | Native asset | Kind | Endpoint |
+|---|---:|---|---|---|
+| Ethereum | `1` | ETH, 18 decimals | mainnet | `https://ethereum-rpc.publicnode.com` |
+| Sepolia | `11155111` | ETH, 18 decimals | testnet | `https://ethereum-sepolia-rpc.publicnode.com` |
+| Hoodi | `560048` | ETH, 18 decimals | testnet | `https://ethereum-hoodi-rpc.publicnode.com` |
 
 `init_defaults` is idempotent — including across restarts — so it may be called
 unconditionally; `applied: false` is not an error. It writes over nothing: an endpoint,
@@ -67,6 +76,15 @@ one way only, `default` → `external`, as soon as any caller writes to it.
 > **All three defaults are one operator.** publicnode sees the traffic of every
 > default-configured wallet. Set your own endpoint (or a SOCKS proxy) in `eth_rpc_ui` if
 > that matters to you — the defaults exist so the wallet works, not because they are private.
+
+## Verified refusals
+
+When a chain requires verified routing and the cached verdict says the proxy
+cannot answer, every RPC method returns `code: "verified_blocked"`, `blocked:
+true`, the `chainId`, and the complete `verifiedProxy` verdict. A transport or
+proxy hop that fails after a usable verdict remains `code: "verified_proxy"`.
+Consumers can therefore render the exact blocked chain without maintaining a
+second gate cache or matching error prose.
 
 ## Build & test
 

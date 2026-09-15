@@ -194,6 +194,26 @@ sections:
         run: "./logos/bin/logoscore call eth_rpc_module list_chains"
         expect_contains:
           - "chains"
+      - title: "Seed registry metadata without replacing the endpoint"
+        run: "./logos/bin/logoscore call eth_rpc_module init_defaults"
+        expect_contains:
+          - "nativeSymbol"
+      - title: "Disable and re-enable a chain"
+        run: |
+          ./logos/bin/logoscore call eth_rpc_module set_chain_enabled 1 false
+          ./logos/bin/logoscore call eth_rpc_module set_chain_enabled 1 true
+        expect_contains:
+          - '"enabled":true'
+      - title: "Select both mainnets and testnets"
+        run: "./logos/bin/logoscore call eth_rpc_module set_network_scope both"
+        expect_contains:
+          - '"scope":"both"'
+      - title: "Read the complete chain registry"
+        run: "./logos/bin/logoscore call eth_rpc_module list_chain_configs"
+        expect_contains:
+          - '"name":"Ethereum"'
+          - '"nativeSymbol":"ETH"'
+          - '"inScope":true'
       - title: "Verify the chain ID (real RPC round-trip)"
         text: "`verify_chain_id` issues a live `eth_chainId` to the mock node."
         # Retry on a transient RPC_FAILED — the first call that drives the module
