@@ -11,9 +11,9 @@ mod proxy;
 mod rpc;
 mod verdict;
 
-pub use rpc::{caller_deadline, diff_chain, methods, mode_label, route_label, ChainChange, ChainConfig,
-              ChainConfigWire, ConfigSource, EthRpc, RpcError, VerifiedClass, VerifiedProxyMode,
-              DEFAULT_ENDPOINTS};
+pub use rpc::{caller_deadline, diff_chain, in_scope, methods, mode_label, route_label, BuiltinChain,
+              ChainChange, ChainConfig, ChainConfigWire, ConfigSource, EthRpc, NetworkScope, RpcError,
+              RouterError, VerifiedClass, VerifiedProxyMode, DEFAULT_CHAINS};
 pub use verdict::{classify_modules_state, hop_budget, classify_readiness, classify_status, evaluate,
                   evaluate_with, GateCache, GateProbe, Readiness, Verdict, HEALTH_TTL,
                   PROXY_MODULE, READY_TTL};

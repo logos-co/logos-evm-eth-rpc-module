@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::proxy::{build_client, ProxyConfig};
+use crate::verdict::Verdict;
+
+fn default_enabled() -> bool {
+    true
+}
 
 fn default_timeout() -> u64 {
     // Well under the 20s Logos RPC deadline. At 30 a single dead endpoint outlived the
@@ -106,7 +111,7 @@ pub enum ConfigSource {
     /// somebody, and calling it ours would license `init_defaults` to overwrite it.
     #[default]
     External,
-    /// `init_defaults` wrote it from [`DEFAULT_ENDPOINTS`].
+    /// `init_defaults` wrote it from [`DEFAULT_CHAINS`].
     #[serde(rename = "default")]
     Builtin,
 }
@@ -118,6 +123,16 @@ pub enum ConfigSource {
 #[serde(rename_all = "camelCase")]
 pub struct ChainConfig {
     pub endpoint: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_decimals: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testnet: Option<bool>,
     #[serde(default)]
     pub proxy: Option<String>,
     #[serde(default)]
@@ -140,11 +155,73 @@ pub struct ChainConfig {
 /// Measured live 2026-08-28. One per chain, not a list: a silent failover changes WHICH node
 /// answered without the consumer knowing. All three are one operator — a reason `eth_rpc_ui`
 /// and the SOCKS proxy exist, not a reason to ship an endpoint that does not work.
-pub const DEFAULT_ENDPOINTS: &[(u64, &str)] = &[
-    (1, "https://ethereum-rpc.publicnode.com"),
-    (11155111, "https://ethereum-sepolia-rpc.publicnode.com"),
-    (560048, "https://ethereum-hoodi-rpc.publicnode.com"),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltinChain {
+    pub chain_id: u64,
+    pub endpoint: &'static str,
+    pub name: &'static str,
+    pub native_symbol: &'static str,
+    pub native_decimals: u8,
+    pub testnet: bool,
+}
+
+pub const DEFAULT_CHAINS: &[BuiltinChain] = &[
+    BuiltinChain {
+        chain_id: 1,
+        endpoint: "https://ethereum-rpc.publicnode.com",
+        name: "Ethereum",
+        native_symbol: "ETH",
+        native_decimals: 18,
+        testnet: false,
+    },
+    BuiltinChain {
+        chain_id: 11_155_111,
+        endpoint: "https://ethereum-sepolia-rpc.publicnode.com",
+        name: "Sepolia",
+        native_symbol: "ETH",
+        native_decimals: 18,
+        testnet: true,
+    },
+    // Multicall3 is deployed here with bytecode identical to mainnet, so the shared
+    // balance path works on every built-in chain.
+    BuiltinChain {
+        chain_id: 560_048,
+        endpoint: "https://ethereum-hoodi-rpc.publicnode.com",
+        name: "Hoodi",
+        native_symbol: "ETH",
+        native_decimals: 18,
+        testnet: true,
+    },
 ];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkScope {
+    #[default]
+    Mainnets,
+    Testnets,
+    Both,
+}
+
+impl NetworkScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mainnets => "mainnets",
+            Self::Testnets => "testnets",
+            Self::Both => "both",
+        }
+    }
+}
+
+pub fn in_scope(cfg: &ChainConfig, scope: NetworkScope) -> bool {
+    cfg.enabled
+        && match (scope, cfg.testnet) {
+            (NetworkScope::Both, _) => true,
+            (NetworkScope::Mainnets, Some(false)) => true,
+            (NetworkScope::Testnets, Some(true)) => true,
+            _ => false,
+        }
+}
 
 impl ChainConfig {
     /// The built-in record for `endpoint`. Verified routing is OFF: it needs an archive node
@@ -152,12 +229,27 @@ impl ChainConfig {
     pub fn builtin(endpoint: &str) -> Self {
         ChainConfig {
             endpoint: endpoint.into(),
+            enabled: true,
+            name: None,
+            native_symbol: None,
+            native_decimals: None,
+            testnet: None,
             proxy: None,
             proxy_required: false,
             timeout_secs: default_timeout(),
             verified_proxy_mode: VerifiedProxyMode::Off,
             verified_timeout_secs: default_verified_timeout(),
             source: ConfigSource::Builtin,
+        }
+    }
+
+    pub fn from_builtin(chain: &BuiltinChain) -> Self {
+        ChainConfig {
+            name: Some(chain.name.into()),
+            native_symbol: Some(chain.native_symbol.into()),
+            native_decimals: Some(chain.native_decimals),
+            testnet: Some(chain.testnet),
+            ..Self::builtin(chain.endpoint)
         }
     }
 
@@ -174,6 +266,12 @@ impl ChainConfig {
     /// nothing about our SOCKS config, so honouring both is impossible and honouring either
     /// silently breaks the guarantee the other was asked for.
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.name.as_ref().is_some_and(|s| s.trim().is_empty()) {
+            return Err("name must not be empty when present".into());
+        }
+        if self.native_symbol.as_ref().is_some_and(|s| s.trim().is_empty()) {
+            return Err("nativeSymbol must not be empty when present".into());
+        }
         if self.proxy_required && self.verified_proxy_mode == VerifiedProxyMode::Required {
             return Err("proxyRequired and verifiedProxyMode=required cannot both be set: the \
                         verified proxy makes its own connections and cannot honour a SOCKS \
@@ -196,6 +294,16 @@ impl ChainConfig {
 pub struct ChainConfigWire {
     pub endpoint: String,
     #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub native_symbol: Option<String>,
+    #[serde(default)]
+    pub native_decimals: Option<u8>,
+    #[serde(default)]
+    pub testnet: Option<bool>,
+    #[serde(default)]
     pub proxy: Option<String>,
     #[serde(default)]
     pub proxy_required: bool,
@@ -213,6 +321,15 @@ impl ChainConfigWire {
     pub fn resolve(self, existing: Option<&ChainConfig>) -> ChainConfig {
         ChainConfig {
             endpoint: self.endpoint,
+            enabled: self.enabled.or_else(|| existing.map(|c| c.enabled)).unwrap_or(true),
+            name: self.name.or_else(|| existing.and_then(|c| c.name.clone())),
+            native_symbol: self
+                .native_symbol
+                .or_else(|| existing.and_then(|c| c.native_symbol.clone())),
+            native_decimals: self
+                .native_decimals
+                .or_else(|| existing.and_then(|c| c.native_decimals)),
+            testnet: self.testnet.or_else(|| existing.and_then(|c| c.testnet)),
             proxy: self.proxy,
             proxy_required: self.proxy_required,
             timeout_secs: self.timeout_secs,
@@ -243,6 +360,7 @@ pub enum RpcError {
     /// The verified path could not answer. NEVER downgraded to a direct call: a caller who
     /// asked for verification gets an error, not an unverified number.
     VerifiedProxy(String),
+    VerifiedBlocked { chain_id: u64, verdict: Verdict },
     /// A read the verified route PROVES was asked for through an explicit url, which cannot
     /// prove anything. Refused rather than answered in the clear.
     VerifiedBypass(String),
@@ -259,6 +377,13 @@ impl std::fmt::Display for RpcError {
             }
             RpcError::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
             RpcError::VerifiedProxy(e) => write!(f, "verified proxy: {e}"),
+            RpcError::VerifiedBlocked { verdict, .. } => {
+                write!(f, "{}", verdict.message)?;
+                if !verdict.detail.is_empty() {
+                    write!(f, " ({})", verdict.detail)?;
+                }
+                Ok(())
+            }
             RpcError::VerifiedBypass(m) => write!(
                 f,
                 "{m} is proof-backed on this chain's verified route: refused through an \
@@ -282,6 +407,7 @@ impl RpcError {
             RpcError::Rpc { .. } => "rpc",
             RpcError::Parse(_) => "parse",
             RpcError::VerifiedProxy(_) => "verified_proxy",
+            RpcError::VerifiedBlocked { .. } => "verified_blocked",
             RpcError::VerifiedBypass(_) => "verified_bypass",
         }
     }
@@ -336,11 +462,13 @@ pub struct ChainChange {
     pub config: bool,
     /// The verified-proxy gate moved, carrying the mode now in force.
     pub mode: Option<VerifiedProxyMode>,
+    /// The device-wide enabled bit moved, carrying the value now in force.
+    pub enabled: Option<bool>,
 }
 
 impl ChainChange {
     pub fn any(&self) -> bool {
-        self.config || self.mode.is_some()
+        self.config || self.mode.is_some() || self.enabled.is_some()
     }
 }
 
@@ -350,7 +478,13 @@ impl ChainChange {
 pub fn diff_chain(before: Option<&ChainConfig>, after: Option<&ChainConfig>) -> ChainChange {
     let mode_of = |c: Option<&ChainConfig>| c.map(|c| c.verified_proxy_mode).unwrap_or_default();
     let (b, a) = (mode_of(before), mode_of(after));
-    ChainChange { config: before != after, mode: (b != a).then_some(a) }
+    let enabled_of = |c: Option<&ChainConfig>| c.map(|c| c.enabled).unwrap_or(false);
+    let (be, ae) = (enabled_of(before), enabled_of(after));
+    ChainChange {
+        config: before != after,
+        mode: (b != a).then_some(a),
+        enabled: (be != ae).then_some(ae),
+    }
 }
 
 /// The JSON-RPC method each typed helper issues. Named once so a caller can ask
@@ -446,27 +580,67 @@ pub trait VerifiedRouter: Send + Sync {
     /// router: a router holding its own copy is a second place the user's setting can go stale.
     /// `Err` is a refusal, never a licence to fall back.
     fn call(&self, chain_id: u64, method: &str, params: &Value, budget: Duration)
-        -> std::result::Result<Value, String>;
+        -> std::result::Result<Value, RouterError>;
+}
+
+#[derive(Clone, Debug)]
+pub enum RouterError {
+    Blocked(Verdict),
+    Failed(String),
 }
 
 /// The RPC client: a persisted map of chainId → [`ChainConfig`].
 pub struct EthRpc {
     chains: HashMap<u64, ChainConfig>,
     store_path: Option<PathBuf>,
+    registry_path: Option<PathBuf>,
+    scope: NetworkScope,
     verified: Option<std::sync::Arc<dyn VerifiedRouter>>,
 }
 
 impl EthRpc {
     pub fn new() -> Self {
-        Self { chains: HashMap::new(), store_path: None, verified: None }
+        Self {
+            chains: HashMap::new(),
+            store_path: None,
+            registry_path: None,
+            scope: NetworkScope::Mainnets,
+            verified: None,
+        }
     }
 
     /// Open a store backed by `path` (a JSON file), loading any existing config.
     pub fn with_store(path: PathBuf) -> Self {
         let mut s = Self::new();
+        s.registry_path = path.parent().map(|p| p.join("registry.json"));
         s.store_path = Some(path);
         s.load();
+        s.load_registry();
         s
+    }
+
+    fn load_registry(&mut self) {
+        let Some(path) = &self.registry_path else { return };
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else { return };
+        if let Some(scope) = value.get("scope").and_then(Value::as_str) {
+            self.scope = match scope {
+                "testnets" => NetworkScope::Testnets,
+                "both" => NetworkScope::Both,
+                _ => NetworkScope::Mainnets,
+            };
+        }
+    }
+
+    fn persist_registry(&self) {
+        let Some(path) = &self.registry_path else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            serde_json::to_string_pretty(&json!({ "scope": self.scope })).unwrap_or_default(),
+        );
     }
 
     fn load(&mut self) {
@@ -532,6 +706,22 @@ impl EthRpc {
                         existing.source = ConfigSource::External;
                     }
                 }
+                if existing.name.is_none() && cfg.name.is_some() {
+                    existing.name = cfg.name.clone();
+                    seeded.push("name".into());
+                }
+                if existing.native_symbol.is_none() && cfg.native_symbol.is_some() {
+                    existing.native_symbol = cfg.native_symbol.clone();
+                    seeded.push("nativeSymbol".into());
+                }
+                if existing.native_decimals.is_none() && cfg.native_decimals.is_some() {
+                    existing.native_decimals = cfg.native_decimals;
+                    seeded.push("nativeDecimals".into());
+                }
+                if existing.testnet.is_none() && cfg.testnet.is_some() {
+                    existing.testnet = cfg.testnet;
+                    seeded.push("testnet".into());
+                }
             }
         }
         if !seeded.is_empty() {
@@ -540,14 +730,129 @@ impl EthRpc {
         seeded
     }
 
-    /// Seed every chain in [`DEFAULT_ENDPOINTS`], per field and only where ABSENT. Idempotent:
+    /// Seed every chain in [`DEFAULT_CHAINS`], per field and only where ABSENT. Idempotent:
     /// a second call from any consumer finds each field present and writes nothing.
     /// Returns what each chain actually gained, so a caller can tell seeding from a no-op.
     pub fn init_defaults(&mut self) -> Vec<(u64, Vec<String>)> {
-        DEFAULT_ENDPOINTS
+        DEFAULT_CHAINS
             .iter()
-            .map(|&(id, url)| (id, self.ensure_chain_config(id, &ChainConfig::builtin(url))))
+            .map(|chain| {
+                (
+                    chain.chain_id,
+                    self.ensure_chain_config(chain.chain_id, &ChainConfig::from_builtin(chain)),
+                )
+            })
             .collect()
+    }
+
+    pub fn network_scope(&self) -> NetworkScope {
+        self.scope
+    }
+
+    pub fn set_network_scope(&mut self, scope: NetworkScope) -> bool {
+        if self.scope == scope {
+            return false;
+        }
+        self.scope = scope;
+        self.persist_registry();
+        true
+    }
+
+    pub fn set_chain_enabled(&mut self, chain_id: u64, enabled: bool) -> std::result::Result<bool, String> {
+        let Some(chain) = self.chains.get_mut(&chain_id) else {
+            return Err(format!("no configuration for chain {chain_id}"));
+        };
+        let changed = chain.enabled != enabled;
+        if changed {
+            chain.enabled = enabled;
+            chain.source = ConfigSource::External;
+            self.persist();
+        }
+        Ok(changed)
+    }
+
+    pub fn patch_chain_metadata(&mut self, chain_id: u64, patch: &Value) -> std::result::Result<(), String> {
+        let Some(fields) = patch.as_object() else {
+            return Err("metadata must be a JSON object".into());
+        };
+        let Some(chain) = self.chains.get(&chain_id) else {
+            return Err(format!("no configuration for chain {chain_id}"));
+        };
+        let mut next = chain.clone();
+        let mut touched = false;
+
+        fn text_field(fields: &serde_json::Map<String, Value>, key: &str) -> std::result::Result<Option<Option<String>>, String> {
+            match fields.get(key) {
+                None => Ok(None),
+                Some(Value::Null) => Ok(Some(None)),
+                Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(Some(s.trim().into()))),
+                Some(Value::String(_)) => Err(format!("{key} must not be empty")),
+                Some(_) => Err(format!("{key} must be a string or null")),
+            }
+        }
+
+        if let Some(value) = text_field(fields, "name")? {
+            next.name = value;
+            touched = true;
+        }
+        if let Some(value) = text_field(fields, "nativeSymbol")? {
+            next.native_symbol = value;
+            touched = true;
+        }
+        if let Some(value) = fields.get("nativeDecimals") {
+            next.native_decimals = match value {
+                Value::Null => None,
+                Value::Number(n) => Some(
+                    n.as_u64()
+                        .filter(|n| *n <= u8::MAX as u64)
+                        .ok_or_else(|| "nativeDecimals must be an integer from 0 to 255".to_string())?
+                        as u8,
+                ),
+                _ => return Err("nativeDecimals must be an integer or null".into()),
+            };
+            touched = true;
+        }
+        if let Some(value) = fields.get("testnet") {
+            next.testnet = match value {
+                Value::Null => None,
+                Value::Bool(v) => Some(*v),
+                _ => return Err("testnet must be a boolean or null".into()),
+            };
+            touched = true;
+        }
+        next.validate()?;
+        if touched && &next != chain {
+            next.source = ConfigSource::External;
+            self.chains.insert(chain_id, next);
+            self.persist();
+        }
+        Ok(())
+    }
+
+    pub fn list_chain_configs(&self) -> Value {
+        let mut rows: Vec<(u8, u64, Value)> = self
+            .chains
+            .iter()
+            .map(|(&chain_id, chain)| {
+                let band = match chain.testnet {
+                    Some(false) => 0,
+                    Some(true) => 1,
+                    None => 2,
+                };
+                let mut row = serde_json::to_value(chain).unwrap_or_else(|_| json!({}));
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("chainId".into(), json!(chain_id));
+                    object.insert("inScope".into(), json!(in_scope(chain, self.scope)));
+                }
+                (band, chain_id, row)
+            })
+            .collect();
+        rows.sort_by_key(|(band, chain_id, _)| (*band, *chain_id));
+        json!({
+            "ok": true,
+            "scope": self.scope,
+            "chains": rows.into_iter().map(|(_, _, row)| row).collect::<Vec<_>>(),
+        })
     }
 
     /// Whether a config has been SET, per chain and rolled up. The roll-up is for DISPLAY: a
@@ -555,13 +860,15 @@ impl EthRpc {
     /// needing seeding, so a consumer calls `init_defaults` unconditionally rather than gating.
     pub fn config_status(&self) -> Value {
         let mut ids: Vec<u64> = self.chains.keys().copied().collect();
-        ids.extend(DEFAULT_ENDPOINTS.iter().map(|&(id, _)| id));
+        ids.extend(DEFAULT_CHAINS.iter().map(|c| c.chain_id));
         ids.sort_unstable();
         ids.dedup();
         let chains: Vec<Value> = ids
             .iter()
             .map(|id| match self.chains.get(id) {
                 Some(c) => json!({ "chainId": id, "state": "configured", "source": c.source,
+                                   "enabled": c.enabled,
+                                   "inScope": in_scope(c, self.scope),
                                    "endpoint": c.endpoint,
                                    "verifiedProxyMode": c.verified_proxy_mode }),
                 None => json!({ "chainId": id, "state": "unconfigured", "source": "none" }),
@@ -704,9 +1011,10 @@ impl EthRpc {
             }
             // REFUSE on failure. Falling back would answer a request for a verified number
             // with an unverified one, which is worse than no answer at all.
-            let v = router
-                .call(chain_id, method, &coerced, budget)
-                .map_err(RpcError::VerifiedProxy)?;
+            let v = router.call(chain_id, method, &coerced, budget).map_err(|e| match e {
+                RouterError::Blocked(verdict) => RpcError::VerifiedBlocked { chain_id, verdict },
+                RouterError::Failed(detail) => RpcError::VerifiedProxy(detail),
+            })?;
             return Ok((normalize_verified_result(v), Some(verified_class(method))));
         }
         let bound = deadline.map(|d| d.min(configured_wall(cfg.timeout_secs)));
@@ -933,9 +1241,11 @@ mod tests {
     use std::net::TcpListener;
 
     fn cfg(endpoint: &str) -> ChainConfig {
-        ChainConfig { endpoint: endpoint.into(), proxy: None, proxy_required: false, timeout_secs: 5,
-            verified_proxy_mode: VerifiedProxyMode::Off, verified_timeout_secs: 15,
-            source: ConfigSource::External }
+        ChainConfig {
+            timeout_secs: 5,
+            source: ConfigSource::External,
+            ..ChainConfig::builtin(endpoint)
+        }
     }
 
     #[test]
@@ -981,6 +1291,7 @@ mod tests {
                 proxy_required: true, // requires a proxy, but none configured
                 timeout_secs: 5, verified_proxy_mode: VerifiedProxyMode::Off, verified_timeout_secs: 15,
                 source: ConfigSource::External,
+                ..ChainConfig::builtin("https://eth.example")
             },
         )
         .unwrap();
@@ -1066,21 +1377,32 @@ mod verified_tests {
     struct SpyRouter {
         seen: Mutex<Vec<(String, Value)>>,
         budget: Mutex<Option<Duration>>,
-        answer: std::result::Result<Value, String>,
+        answer: std::result::Result<Value, RouterError>,
     }
     impl SpyRouter {
-        fn new(answer: std::result::Result<Value, String>) -> Arc<Self> {
+        fn new(answer: std::result::Result<Value, RouterError>) -> Arc<Self> {
             Arc::new(Self { seen: Mutex::new(vec![]), budget: Mutex::new(None), answer })
         }
         fn ok(v: Value) -> Arc<Self> { Self::new(Ok(v)) }
-        fn failing() -> Arc<Self> { Self::new(Err("proxy is not running".into())) }
+        fn failing() -> Arc<Self> {
+            Self::new(Err(RouterError::Failed("proxy is not running".into())))
+        }
+        fn blocked() -> Arc<Self> {
+            Self::new(Err(RouterError::Blocked(Verdict {
+                state: "wrong_chain",
+                usable: false,
+                message: "The verified proxy is on another chain.".into(),
+                action: "open_verified_proxy",
+                detail: "expected 1".into(),
+            })))
+        }
         fn last(&self) -> (String, Value) { self.seen.lock().unwrap().last().cloned().unwrap() }
         fn count(&self) -> usize { self.seen.lock().unwrap().len() }
         fn budget(&self) -> Option<Duration> { *self.budget.lock().unwrap() }
     }
     impl VerifiedRouter for SpyRouter {
         fn call(&self, _c: u64, m: &str, p: &Value, budget: Duration)
-            -> std::result::Result<Value, String>
+            -> std::result::Result<Value, RouterError>
         {
             self.seen.lock().unwrap().push((m.to_string(), p.clone()));
             *self.budget.lock().unwrap() = Some(budget);
@@ -1093,8 +1415,9 @@ mod verified_tests {
             // Deliberately unreachable: if routing ever falls through to the direct path the
             // test fails, rather than quietly passing against a real node.
             endpoint: "http://127.0.0.1:1/never".into(),
-            proxy: None, proxy_required: false, timeout_secs: 1,
             verified_proxy_mode: mode, verified_timeout_secs: 1, source: ConfigSource::External,
+            timeout_secs: 1,
+            ..ChainConfig::builtin("http://127.0.0.1:1/never")
         }
     }
     fn verified_rpc(router: Arc<SpyRouter>) -> EthRpc {
@@ -1145,6 +1468,20 @@ mod verified_tests {
         assert!(matches!(e, RpcError::VerifiedProxy(_)), "got {e}");
         assert!(e.to_string().contains("proxy is not running"));
         assert_eq!(spy.count(), 1, "one attempt, and no retry against the endpoint");
+    }
+
+    #[test]
+    fn a_gate_refusal_keeps_the_full_verdict() {
+        let r = verified_rpc(SpyRouter::blocked());
+        match r.get_balance(1, "0xabc") {
+            Err(RpcError::VerifiedBlocked { chain_id, verdict }) => {
+                assert_eq!(chain_id, 1);
+                assert_eq!(verdict.state, "wrong_chain");
+                assert_eq!(verdict.action, "open_verified_proxy");
+                assert_eq!(verdict.detail, "expected 1");
+            }
+            other => panic!("expected structured verified refusal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1231,6 +1568,7 @@ mod verified_tests {
             proxy_required: true, timeout_secs: 8,
             verified_proxy_mode: VerifiedProxyMode::Required, verified_timeout_secs: 15,
             source: ConfigSource::External,
+            ..ChainConfig::builtin("https://x")
         };
         assert!(bad.validate().is_err());
         assert!(r.set_chain_config(1, bad).is_err(), "the store must refuse the contradiction");
@@ -1431,15 +1769,20 @@ mod defaults_tests {
 
     #[test]
     fn the_shipped_defaults_cover_the_wallets_three_chains_with_verified_routing_off() {
-        let ids: Vec<u64> = DEFAULT_ENDPOINTS.iter().map(|&(id, _)| id).collect();
+        let ids: Vec<u64> = DEFAULT_CHAINS.iter().map(|c| c.chain_id).collect();
         assert_eq!(ids, vec![1, 11155111, 560048]);
-        for &(_, url) in DEFAULT_ENDPOINTS {
-            let c = ChainConfig::builtin(url);
-            assert!(url.starts_with("https://"), "{url} must not be plaintext http");
+        for builtin in DEFAULT_CHAINS {
+            let c = ChainConfig::from_builtin(builtin);
+            assert!(builtin.endpoint.starts_with("https://"), "{} must not be plaintext http", builtin.endpoint);
             assert_eq!(c.verified_proxy_mode, VerifiedProxyMode::Off,
                        "verified routing needs an archive node the public defaults are not");
             assert_eq!(c.source, ConfigSource::Builtin);
             assert!(c.proxy.is_none() && !c.proxy_required);
+            assert!(c.enabled);
+            assert_eq!(c.name.as_deref(), Some(builtin.name));
+            assert_eq!(c.native_symbol.as_deref(), Some(builtin.native_symbol));
+            assert_eq!(c.native_decimals, Some(18));
+            assert_eq!(c.testnet, Some(builtin.testnet));
             c.validate().expect("a shipped default must be representable");
         }
     }
@@ -1448,14 +1791,16 @@ mod defaults_tests {
     fn initializing_twice_writes_nothing_the_second_time() {
         let mut r = EthRpc::new();
         let first = seeded_map(r.init_defaults());
-        for &(id, _) in DEFAULT_ENDPOINTS {
-            assert_eq!(first[&id], vec!["*".to_string()], "chain {id} should be seeded whole");
+        for builtin in DEFAULT_CHAINS {
+            assert_eq!(first[&builtin.chain_id], vec!["*".to_string()],
+                       "chain {} should be seeded whole", builtin.chain_id);
         }
         let after_first = snapshot(&r);
 
         let second = seeded_map(r.init_defaults());
-        for &(id, _) in DEFAULT_ENDPOINTS {
-            assert!(second[&id].is_empty(), "chain {id} was rewritten by a second call");
+        for builtin in DEFAULT_CHAINS {
+            assert!(second[&builtin.chain_id].is_empty(),
+                    "chain {} was rewritten by a second call", builtin.chain_id);
         }
         assert_eq!(snapshot(&r), after_first, "a second init_defaults must not change a byte");
     }
@@ -1486,7 +1831,11 @@ mod defaults_tests {
         r.set_chain_config(1, mine).unwrap();
 
         let seeded = seeded_map(r.init_defaults());
-        assert!(seeded[&1].is_empty(), "a configured chain must not be touched");
+        assert_eq!(
+            seeded[&1],
+            vec!["name", "nativeSymbol", "nativeDecimals", "testnet"],
+            "only absent registry metadata is filled",
+        );
         assert_eq!(seeded[&11155111], vec!["*".to_string()], "the absent chains still get seeded");
 
         let got = r.get_chain_config(1).unwrap();
@@ -1507,7 +1856,10 @@ mod defaults_tests {
         r.set_chain_config(11155111, half).unwrap();
 
         let seeded = seeded_map(r.init_defaults());
-        assert_eq!(seeded[&11155111], vec!["endpoint".to_string()]);
+        assert_eq!(
+            seeded[&11155111],
+            vec!["endpoint", "name", "nativeSymbol", "nativeDecimals", "testnet"],
+        );
         let got = r.get_chain_config(11155111).unwrap();
         assert_eq!(got.endpoint, "https://ethereum-sepolia-rpc.publicnode.com");
         assert_eq!(got.proxy.as_deref(), Some("socks5h://127.0.0.1:9050"),
@@ -1537,8 +1889,11 @@ mod defaults_tests {
         r.apply_chain_config(1, serde_json::from_str(wire).unwrap()).unwrap();
         assert_eq!(r.get_chain_config(1).unwrap().source, ConfigSource::External,
                    "source is not on ChainConfigWire, so the key is ignored");
-        // And so init_defaults leaves the endpoint alone.
-        assert!(seeded_map(r.init_defaults())[&1].is_empty());
+        // And so init_defaults leaves the endpoint alone while filling missing registry facts.
+        assert_eq!(
+            seeded_map(r.init_defaults())[&1],
+            vec!["name", "nativeSymbol", "nativeDecimals", "testnet"],
+        );
         assert_eq!(r.get_chain_config(1).unwrap().endpoint, "https://theirs");
 
         // The glue's ensure_chain_config path parses a bare ChainConfig, which DOES carry
@@ -1571,7 +1926,7 @@ mod defaults_tests {
         assert_eq!(s["state"], json!("unconfigured"));
         assert_eq!(s["source"], json!("none"));
         let rows = s["chains"].as_array().unwrap();
-        assert_eq!(rows.len(), DEFAULT_ENDPOINTS.len());
+        assert_eq!(rows.len(), DEFAULT_CHAINS.len());
         assert_eq!(rows[0]["chainId"], json!(1));
         assert_eq!(rows[0]["state"], json!("unconfigured"));
         assert_eq!(rows[0]["source"], json!("none"));
@@ -1602,10 +1957,115 @@ mod defaults_tests {
         r.init_defaults();
         let rows = r.config_status();
         let rows = rows["chains"].as_array().unwrap();
-        assert_eq!(rows.len(), DEFAULT_ENDPOINTS.len() + 1);
+        assert_eq!(rows.len(), DEFAULT_CHAINS.len() + 1);
         assert_eq!(rows[1]["chainId"], json!(31337), "the union is sorted by chainId");
         assert_eq!(rows[1]["state"], json!("configured"));
         assert_eq!(r.get_chain_config(31337).unwrap().endpoint, "http://127.0.0.1:8545");
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_records_stay_enabled_but_do_not_invent_metadata() {
+        let chain: ChainConfig = serde_json::from_str(r#"{"endpoint":"https://node"}"#).unwrap();
+        assert!(chain.enabled);
+        assert!(chain.name.is_none());
+        assert!(chain.native_symbol.is_none());
+        assert!(chain.native_decimals.is_none());
+        assert!(chain.testnet.is_none());
+    }
+
+    #[test]
+    fn the_three_networks_are_distinct_resolvable_and_only_ethereum_is_mainnet() {
+        let mut ids: Vec<u64> = DEFAULT_CHAINS.iter().map(|chain| chain.chain_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), DEFAULT_CHAINS.len());
+        assert_eq!(DEFAULT_CHAINS.iter().filter(|chain| !chain.testnet).count(), 1);
+        assert_eq!(DEFAULT_CHAINS.iter().find(|chain| !chain.testnet).unwrap().chain_id, 1);
+        assert!(DEFAULT_CHAINS.iter().all(|chain| {
+            !chain.name.is_empty() && !chain.native_symbol.is_empty() && chain.native_decimals == 18
+        }));
+    }
+
+    #[test]
+    fn scope_requires_enabled_and_unknown_networks_only_belong_to_both() {
+        let mainnet = ChainConfig::from_builtin(&DEFAULT_CHAINS[0]);
+        let testnet = ChainConfig::from_builtin(&DEFAULT_CHAINS[1]);
+        let unknown = ChainConfig::builtin("https://unknown");
+        assert!(in_scope(&mainnet, NetworkScope::Mainnets));
+        assert!(!in_scope(&mainnet, NetworkScope::Testnets));
+        assert!(in_scope(&testnet, NetworkScope::Testnets));
+        assert!(!in_scope(&testnet, NetworkScope::Mainnets));
+        assert!(!in_scope(&unknown, NetworkScope::Mainnets));
+        assert!(!in_scope(&unknown, NetworkScope::Testnets));
+        assert!(in_scope(&unknown, NetworkScope::Both));
+
+        let mut disabled = mainnet;
+        disabled.enabled = false;
+        assert!(!in_scope(&disabled, NetworkScope::Both));
+    }
+
+    #[test]
+    fn an_old_whole_record_writer_preserves_registry_fields() {
+        let mut rpc = EthRpc::new();
+        rpc.set_chain_config(1, ChainConfig::from_builtin(&DEFAULT_CHAINS[0])).unwrap();
+        let old: ChainConfigWire = serde_json::from_str(
+            r#"{"endpoint":"https://mine","proxyRequired":false,"timeoutSecs":8}"#,
+        )
+        .unwrap();
+        rpc.apply_chain_config(1, old).unwrap();
+        let chain = rpc.get_chain_config(1).unwrap();
+        assert!(chain.enabled);
+        assert_eq!(chain.name.as_deref(), Some("Ethereum"));
+        assert_eq!(chain.native_symbol.as_deref(), Some("ETH"));
+        assert_eq!(chain.native_decimals, Some(18));
+        assert_eq!(chain.testnet, Some(false));
+    }
+
+    #[test]
+    fn metadata_patch_distinguishes_omitted_from_explicit_null() {
+        let mut rpc = EthRpc::new();
+        rpc.set_chain_config(1, ChainConfig::from_builtin(&DEFAULT_CHAINS[0])).unwrap();
+        rpc.patch_chain_metadata(1, &json!({"name": "Ethereum Mainnet", "testnet": null}))
+            .unwrap();
+        let chain = rpc.get_chain_config(1).unwrap();
+        assert_eq!(chain.name.as_deref(), Some("Ethereum Mainnet"));
+        assert_eq!(chain.native_symbol.as_deref(), Some("ETH"), "omitted means keep");
+        assert_eq!(chain.testnet, None, "explicit null clears");
+    }
+
+    #[test]
+    fn scope_and_enabled_state_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chains.json");
+        {
+            let mut rpc = EthRpc::with_store(path.clone());
+            rpc.init_defaults();
+            assert!(rpc.set_chain_enabled(11_155_111, false).unwrap());
+            assert!(rpc.set_network_scope(NetworkScope::Both));
+        }
+        let rpc = EthRpc::with_store(path);
+        assert!(!rpc.get_chain_config(11_155_111).unwrap().enabled);
+        assert_eq!(rpc.network_scope(), NetworkScope::Both);
+    }
+
+    #[test]
+    fn listing_is_mainnets_then_testnets_and_reports_scope() {
+        let mut rpc = EthRpc::new();
+        rpc.init_defaults();
+        rpc.set_network_scope(NetworkScope::Testnets);
+        let reply = rpc.list_chain_configs();
+        assert_eq!(reply["scope"], json!("testnets"));
+        let rows = reply["chains"].as_array().unwrap();
+        assert_eq!(rows[0]["chainId"], json!(1));
+        assert_eq!(rows[0]["inScope"], json!(false));
+        assert_eq!(rows[1]["chainId"], json!(560_048));
+        assert_eq!(rows[2]["chainId"], json!(11_155_111));
+        assert!(rows[1..].iter().all(|row| row["inScope"] == json!(true)));
     }
 }
 
@@ -1616,9 +2076,11 @@ mod change_tests {
     use super::*;
 
     fn cfg(mode: VerifiedProxyMode) -> ChainConfig {
-        ChainConfig { endpoint: "https://mine".into(), proxy: None, proxy_required: false,
-            timeout_secs: 8, verified_proxy_mode: mode, verified_timeout_secs: 15,
-            source: ConfigSource::External }
+        ChainConfig {
+            verified_proxy_mode: mode,
+            source: ConfigSource::External,
+            ..ChainConfig::builtin("https://mine")
+        }
     }
 
     /// What `EthRpcModuleImpl::write_diffed` does, minus the lock.
@@ -1632,7 +2094,7 @@ mod change_tests {
     fn a_new_chain_reports_its_record_but_no_gate_move() {
         let mut r = EthRpc::new();
         let c = diff_of(&mut r, 1, |r| { r.set_chain_config(1, cfg(VerifiedProxyMode::Off)).unwrap(); });
-        assert_eq!(c, ChainChange { config: true, mode: None },
+        assert_eq!(c, ChainChange { config: true, mode: None, enabled: Some(true) },
                    "a chain arriving off was already effectively off");
     }
 
@@ -1663,7 +2125,11 @@ mod change_tests {
         let c = diff_of(&mut r, 1, |r| {
             r.set_verified_proxy_mode(1, VerifiedProxyMode::Required).unwrap();
         });
-        assert_eq!(c, ChainChange { config: true, mode: Some(VerifiedProxyMode::Required) });
+        assert_eq!(c, ChainChange {
+            config: true,
+            mode: Some(VerifiedProxyMode::Required),
+            enabled: None,
+        });
         assert_eq!(mode_label(c.mode.unwrap()), "required");
     }
 
@@ -1694,7 +2160,11 @@ mod change_tests {
         let mut r = EthRpc::new();
         r.set_chain_config(1, cfg(VerifiedProxyMode::Required)).unwrap();
         let c = diff_of(&mut r, 1, |r| { assert!(r.remove_chain_config(1)); });
-        assert_eq!(c, ChainChange { config: true, mode: Some(VerifiedProxyMode::Off) },
+        assert_eq!(c, ChainChange {
+            config: true,
+            mode: Some(VerifiedProxyMode::Off),
+            enabled: Some(false),
+        },
                    "no config reads as off, and a consumer gating on required must hear it");
     }
 
@@ -1710,7 +2180,7 @@ mod change_tests {
         let mut r = EthRpc::new();
         r.set_chain_config(1, cfg(VerifiedProxyMode::Required)).unwrap();
         let moved = diff_of(&mut r, 1, |r| { assert!(r.patch_chain_endpoint(1, "https://new")); });
-        assert_eq!(moved, ChainChange { config: true, mode: None },
+        assert_eq!(moved, ChainChange { config: true, mode: None, enabled: None },
                    "an endpoint change does not move the gate");
         let same = diff_of(&mut r, 1, |r| { assert!(r.patch_chain_endpoint(1, "  https://new  ")); });
         assert!(!same.any(), "the trimmed value is what is stored, so this is a no-op");
@@ -1725,7 +2195,7 @@ mod change_tests {
         let same = diff_of(&mut r, 1, |r| { assert!(r.patch_chain_transport(1, Some(8), Some(15))); });
         assert!(!same.any());
         let moved = diff_of(&mut r, 1, |r| { assert!(r.patch_chain_transport(1, Some(9), None)); });
-        assert_eq!(moved, ChainChange { config: true, mode: None });
+        assert_eq!(moved, ChainChange { config: true, mode: None, enabled: None });
     }
 
     #[test]
@@ -1733,7 +2203,7 @@ mod change_tests {
         let mut r = EthRpc::new();
         let mine = cfg(VerifiedProxyMode::Off);
         let seeded = diff_of(&mut r, 1, |r| { assert!(!r.ensure_chain_config(1, &mine).is_empty()); });
-        assert_eq!(seeded, ChainChange { config: true, mode: None });
+        assert_eq!(seeded, ChainChange { config: true, mode: None, enabled: Some(true) });
         let again = diff_of(&mut r, 1, |r| { assert!(r.ensure_chain_config(1, &mine).is_empty()); });
         assert!(!again.any());
     }
@@ -1744,11 +2214,11 @@ mod change_tests {
     fn seeding_defaults_reports_each_chain_once_and_never_again() {
         let mut r = EthRpc::new();
         let first = r.init_defaults();
-        assert_eq!(first.iter().filter(|(_, w)| !w.is_empty()).count(), DEFAULT_ENDPOINTS.len());
+        assert_eq!(first.iter().filter(|(_, w)| !w.is_empty()).count(), DEFAULT_CHAINS.len());
         let second = r.init_defaults();
         assert!(second.iter().all(|(_, w)| w.is_empty()), "a second call announces nothing");
-        for &(id, _) in DEFAULT_ENDPOINTS {
-            assert_eq!(r.get_chain_config(id).unwrap().verified_proxy_mode, VerifiedProxyMode::Off,
+        for builtin in DEFAULT_CHAINS {
+            assert_eq!(r.get_chain_config(builtin.chain_id).unwrap().verified_proxy_mode, VerifiedProxyMode::Off,
                        "seeding never moves the gate, so it emits no mode event");
         }
     }
