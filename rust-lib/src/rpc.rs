@@ -503,26 +503,14 @@ pub mod methods {
     pub const GET_TRANSACTION_BY_HASH: &str = "eth_getTransactionByHash";
 }
 
-/// Rewrite params for the verified leg ONLY.
+/// Rewrite params for the verified leg ONLY: what real nodes get never changes.
 ///
-/// What eth_rpc sends to real nodes must not change: `eth_feeHistory`'s blockCount is a hex
-/// QUANTITY string per ethereum/execution-apis, and the proxy declaring it `u64` is the
-/// non-conformant side. Coercing at the source would make a shared module violate the spec to
-/// suit one consumer, and be wrong against any strict node. So the translation lives here,
-/// where it is the proxy's dialect being accommodated.
-///
-/// Every rule below was MEASURED against a live sepolia light client, not inferred.
+/// Every rule below was MEASURED against a live light client, not inferred. `eth_feeHistory`
+/// needs none: since nimbus 71f2a085 the proxy takes the spec's hex blockCount and refuses a
+/// number.
 pub fn verified_params(method: &str, params: &Value) -> Value {
     let mut p = params.as_array().cloned().unwrap_or_default();
     match method {
-        // A hex blockCount returns success:true with EMPTY arrays — no error, just nothing.
-        "eth_feeHistory" => {
-            if let Some(Value::String(h)) = p.first().cloned() {
-                if let Some(n) = h.strip_prefix("0x").and_then(|x| u64::from_str_radix(x, 16).ok()) {
-                    p[0] = json!(n);
-                }
-            }
-        }
         // "pending" is REFUSED and unverifiable by construction: a light client proves against
         // a header's stateRoot and pending has no canonical header. "latest" is the only tag
         // that works — which is what makes nonce reservation load-bearing in verified mode.
@@ -1428,15 +1416,13 @@ mod verified_tests {
     }
 
     #[test]
-    fn fee_history_block_count_becomes_a_number_on_the_verified_leg_only() {
+    fn fee_history_block_count_stays_hex_on_the_verified_leg() {
         let spy = SpyRouter::ok(json!({ "baseFeePerGas": ["0x1"] }));
         let r = verified_rpc(spy.clone());
         r.fee_history(1, 4, json!([25])).unwrap();
         let (m, p) = spy.last();
         assert_eq!(m, "eth_feeHistory");
-        assert_eq!(p[0], json!(4), "a hex blockCount returns success with EMPTY arrays");
-        // The spec-conformant hex is untouched off the verified leg: verified_params is the
-        // ONLY place this differs, so a real node still gets what the spec says.
+        assert_eq!(p[0], json!("0x4"), "the proxy refuses a number: quantity must be 0x-prefixed hex");
         assert_eq!(verified_params("eth_getBalance", &json!(["0xa", "latest"]))[1], json!("latest"));
     }
 
