@@ -145,7 +145,7 @@ flowchart TB
 | `lib.rs` | crate root | Declares `mod proxy; mod rpc;` and `#[cfg(feature="logos_module")] mod glue;`. Re-exports `ChainConfig`, `EthRpc`, `RpcError`. |
 | `rpc.rs` | `EthRpc` | The RPC client: `HashMap<u64, ChainConfig>` + optional JSON store path; per-chain typed RPC helpers. |
 | `rpc.rs` | `ChainConfig` | Per-chain config struct (camelCase serde). |
-| `rpc.rs` | `ConfigSource` / `DEFAULT_ENDPOINTS` | Who wrote a chain's record, and the built-in public endpoints `init_defaults` seeds (§5.6). |
+| `rpc.rs` | `ConfigSource` / `DEFAULT_CHAINS` | Who wrote a chain's record, and the built-in public endpoints `init_defaults` seeds (§5.6). |
 | `rpc.rs` | `RpcError` | Error enum: `UnknownChain`, `Proxy`, `Http`, `Rpc{code,message}`, `Parse`. |
 | `proxy.rs` | `ProxyConfig` | Outbound policy: `proxy`, `proxy_required`, `timeout_secs`. |
 | `proxy.rs` | `build_client` | **The only** `reqwest::Client` constructor; fails closed. |
@@ -265,7 +265,8 @@ Return the stored config for a chain.
 - **Lock:** READ.
 
 #### `remove_chain_config(chain_id: i64) -> bool`
-Delete a chain's config and persist.
+Delete a chain's config and persist. A built-in chain removed here stays removed: `init_defaults`
+seeds a missing default at most once per device (§5.6).
 - **Returns** `true` if a config existed and was removed; `false` if absent or context not ready.
 - **Lock:** WRITE.
 
@@ -492,9 +493,10 @@ module inherits a closure from the gate.
 
 ### 5.6 Initialization convention (`config_status`, `init_defaults`)
 
-The module is usable with **no external configuration**: a consumer asks whether a config has
-been set, and if not seeds the built-in public endpoints. Neither method performs network I/O
-or calls another module, so both are cheap enough for a consumer's context-ready path.
+The module is usable with **no external configuration**, but it never seeds itself: the
+consumers that compose it — the app backends — call `init_defaults` on start, unconditionally.
+`config_status` reports what is set, for display. Neither method performs network I/O or calls
+another module, so both are cheap enough for a consumer's context-ready path.
 
 Two independent questions, kept apart by the `state` field — never by matching the message:
 
@@ -507,7 +509,7 @@ Two independent questions, kept apart by the `state` field — never by matching
 Whether a config has been set, per chain and rolled up.
 - **Success:** `{ ok:true, state:"configured"|"unconfigured", source:"external"|"default"|"none",
   chains:[ { chainId, state, source, endpoint?, verifiedProxyMode? } ] }`.
-- `chains` is the **union** of the stored chains and `DEFAULT_ENDPOINTS`, sorted by `chainId`;
+- `chains` is the **union** of the stored chains and `DEFAULT_CHAINS`, sorted by `chainId`;
   a chain with no record is listed as `state:"unconfigured", source:"none"` and carries no
   `endpoint`.
 - Module-level `state` is `configured` if **any** chain is; `source` is `external` if **any**
@@ -517,20 +519,27 @@ Whether a config has been set, per chain and rolled up.
 - **Lock:** READ.
 
 #### `init_defaults() -> String`
-Seed the built-in endpoints, per chain and per **field**, only where absent.
+Seed the built-in chains, per chain and per **field**, only where absent. This module never
+calls it; any consumer may, unconditionally and at any time — `eth_wallet_backend` and
+`uniswap_backend` do on start. Do not gate it on `config_status`: a store holding only a
+chain 1 endpoint is already `configured`, yet still lacks chain 1's name and the other chains.
 - **Success:** `{ ok:true, applied:bool, seeded:{ "<chainId>": ["*"|"endpoint", …] } }`.
-  `"*"` means the whole record was written; `[]` means the chain was already there.
-  `applied` is `true` iff any chain was written.
+  `"*"` means the whole record was written; `[]` means the chain was left as it was — already
+  there, or offered before and since removed. `applied` is `true` iff any chain was written.
+- **A missing default chain is seeded at most once per device.** `registry.json` records every
+  default id offered (`offeredDefaults`, §6.4), so a chain the user removed with
+  `remove_chain_config` stays removed. A chain still present keeps gaining the fields it lacks,
+  which is how a record `patch_chain_endpoint` created bare gets its name, native asset and
+  testnet flag. A registry without the record reads as nothing offered: the first call seeds
+  the missing defaults once.
 - **Idempotent, and idempotent across restarts.** A second call — from any consumer — writes
   nothing and answers `applied:false`, which is **not an error**. Two consumers racing both
   succeed; exactly one sees `applied:true`.
-- Implemented as [`EthRpc::ensure_chain_config`] in a loop, so it is idempotent **per chain**
-  and a consumer may call it unconditionally rather than gating on `config_status`.
 - Every chain it writes has its memoized verified-proxy verdict invalidated (§5.5).
 - **Error:** the same `state:"unready"` refusal as above.
 - **Lock:** WRITE.
 
-#### The built-in endpoints (`DEFAULT_ENDPOINTS`, `rpc.rs`)
+#### The built-in endpoints (`DEFAULT_CHAINS`, `rpc.rs`)
 
 | Chain | id | Endpoint |
 |---|---|---|
@@ -549,8 +558,9 @@ needs an archive node these are not, and `validate()` refuses it beside `proxyRe
 
 #### Never downgrade
 
-`init_defaults` can only ever **fill an absent slot**: an absent record, or an absent field of
-a record already there. It writes over nothing, whatever the record's `source`. `chains.json`
+`init_defaults` can only ever **fill an absent slot**: an absent record it has never offered,
+or an absent field of a record already there. It writes over nothing, whatever the record's
+`source`, and does not bring back a chain the user removed. `chains.json`
 is shared with other wallets on the device, so this is the same discipline `ChainConfigWire`
 already applies to `set_chain_config` (§6.1).
 
@@ -676,9 +686,9 @@ per call from the chain's `ChainConfig` in `EthRpc::client_for`. Errors:
 | `ProxyUnusable(s)` | `proxy URL is invalid or unsupported: <s>` (also fires for unsupported schemes) |
 | `Build(s)` | `failed to build HTTP client: <s>` |
 
-### 6.4 Persisted state — `chains.json`
+### 6.4 Persisted state — `chains.json` and `registry.json`
 
-State is a single JSON file at `<instance_persistence_path>/chains.json`, written by
+Chain records live in `<instance_persistence_path>/chains.json`, written by
 `EthRpc::persist` (pretty-printed) and read by `EthRpc::load`. Shape is a string-keyed map
 (chainId stringified) of `ChainConfig`:
 
@@ -693,9 +703,22 @@ State is a single JSON file at `<instance_persistence_path>/chains.json`, writte
 - The parent directory is created on first write (`create_dir_all`).
 - The file is rewritten in full on every `set_chain_config` / `remove_chain_config`.
 - Config survives a daemon restart (proven by `config_store_roundtrip_persists`).
-- The absence of this file is the only signal that nothing has been configured, which is what
-  makes `init_defaults` idempotent **across process lifetimes** and not merely within one
-  (`initialization_is_still_a_no_op_after_a_restart`).
+
+The device-wide settings live beside it in `registry.json`, written by
+`EthRpc::persist_registry` and read by `EthRpc::load_registry`:
+
+```json
+{ "scope": "mainnets", "offeredDefaults": [1, 560048, 11155111] }
+```
+
+- `scope` is the network scope; absent reads as `mainnets`.
+- `offeredDefaults` is every `DEFAULT_CHAINS` id `init_defaults` has offered, written after the
+  chains it seeded are on disk. Absent — a registry written before it existed — reads as
+  nothing offered.
+- Together the two files make `init_defaults` idempotent **across process lifetimes** and not
+  merely within one: `chains.json` keeps every seeded field present, and `offeredDefaults`
+  keeps a removed default removed (`initialization_is_still_a_no_op_after_a_restart`,
+  `the_offered_record_survives_a_restart`).
 
 ---
 
@@ -779,6 +802,11 @@ The initialization convention (§5.6) has its own module, `rpc::defaults_tests`:
 | `an_empty_store_reports_unconfigured_and_still_lists_what_it_could_seed` | the `unconfigured` / `source:"none"` shape. |
 | `config_status_separates_a_default_from_a_value_the_user_chose` | per-chain `source`, and one external chain making the roll-up external. |
 | `a_chain_outside_the_defaults_is_reported_but_never_seeded` | the union is reported; `init_defaults` touches only its own table. |
+| `an_endpoint_set_before_any_consumer_still_gains_its_identity_and_scope` | chain 1 created bare by `patch_chain_endpoint` gains its name, native asset and testnet flag, keeps its endpoint and lands in `mainnets`; the other defaults are seeded. |
+| `a_default_the_user_removed_stays_removed` | a removed default is not seeded again (`applied:false`); one the user brings back gains the fields it lacks. |
+| `a_second_call_writes_nothing_and_answers_applied_false` | the reply's `applied:false`, and neither `chains.json` nor `registry.json` is rewritten. |
+| `the_offered_record_survives_a_restart` | `offeredDefaults` is persisted, and a restart does not offer a removed default again. |
+| `a_registry_written_before_the_record_seeds_the_missing_defaults_once` | a scope-only `registry.json` reads as nothing offered: the missing defaults are seeded once, and the scope is kept. |
 
 ### 8.2 Build / package via nix
 

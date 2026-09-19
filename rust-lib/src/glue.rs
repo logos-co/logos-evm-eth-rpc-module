@@ -25,8 +25,9 @@ use logos_rust_sdk::LogosModuleSDK;
 use serde_json::{json, Value};
 
 use crate::rpc::{
-    diff_chain, methods, mode_label, route_label, ChainChange, ChainConfig, ChainConfigWire,
-    EthRpc, NetworkScope, RouterError, VerifiedClass, VerifiedProxyMode, VerifiedRouter, RpcError,
+    defaults_reply, diff_chain, methods, mode_label, route_label, ChainChange, ChainConfig,
+    ChainConfigWire, EthRpc, NetworkScope, RouterError, VerifiedClass, VerifiedProxyMode,
+    VerifiedRouter, RpcError,
 };
 use crate::verdict::{classify_readiness, GateCache, GateProbe, Readiness, Verdict, PROXY_MODULE};
 
@@ -107,9 +108,11 @@ pub trait EthRpcModule: Send + Sync + 'static {
     /// discriminator (`unready` / `unconfigured` / `configured`); never match on the message.
     /// `{ ok, state, source, chains: [{ chainId, state, source, endpoint?, verifiedProxyMode? }] }`.
     fn config_status(&self) -> String;
-    /// Seed the built-in public endpoints, per chain and per FIELD, only where absent. Keyed
-    /// and idempotent per chain, so a consumer may call it unconditionally; a second call from
-    /// any consumer writes nothing and answers `applied: false`, which is not an error.
+    /// Seed the built-in chains, per chain and per FIELD, only where absent. This module never
+    /// calls it itself; any consumer may, unconditionally and at any time. A missing default
+    /// chain is seeded at most once per device (`registry.json` records each one offered), so
+    /// one removed with `remove_chain_config` stays removed. A second call from any consumer
+    /// writes nothing and answers `applied: false`, which is not an error.
     /// `{ ok, applied, seeded: { "<chainId>": ["*" | "endpoint", ...] } }`.
     fn init_defaults(&self) -> String;
 
@@ -663,20 +666,16 @@ impl EthRpcModule for EthRpcModuleImpl {
         // Same reason `mutate` does it: a memoized verdict for a chain we just seeded is stale.
         // Seeding only ever fills an ABSENT field with a builtin record, whose mode is `off` —
         // the value an unconfigured chain already reported — so the gate never moves here.
-        let mut applied = false;
-        let mut fields = serde_json::Map::new();
         for (id, written) in &seeded {
             if !written.is_empty() {
-                applied = true;
                 self.router.gate.invalidate(*id);
                 emit_chain_config_changed(*id as i64);
                 if written.len() == 1 && written[0] == "*" {
                     emit_chain_enabled_changed(*id as i64, true);
                 }
             }
-            fields.insert(id.to_string(), json!(written));
         }
-        json!({ "ok": true, "applied": applied, "seeded": fields }).to_string()
+        defaults_reply(&seeded).to_string()
     }
 
     fn raw_rpc_url(&self, chain_id: i64, url: String, method: String, params_json: String) -> String {
