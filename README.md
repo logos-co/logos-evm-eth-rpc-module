@@ -54,13 +54,12 @@ Removing a chain's config reports `"off"`: no configuration is what
 
 ## Working with no configuration at all
 
-The module ships defaults, so a consumer needs no UI app installed to work. All
-three start enabled and the fresh-device scope is `mainnets`. A chain is in scope
-only when it is enabled and its `testnet` classification matches the scope;
-unknown classifications are included only by `both`. Ask
-`config_status()` — `{ ok, state, source, chains }`, where `state` is `unready`
-(context not ready — ask again), `unconfigured`, or `configured` — then call
-`init_defaults()`, which seeds these per chain and per **field**, only where absent:
+The module ships defaults, so a consumer needs no UI app installed to work. It never
+seeds them itself: a consumer calls `init_defaults()` — the app backends do on start —
+which seeds the chains below per chain and per **field**, only where absent. All three start
+enabled and the fresh-device scope is `mainnets`. A chain is in scope only when it is
+enabled and its `testnet` classification matches the scope; unknown classifications
+are included only by `both`.
 
 | Chain | id | Native asset | Kind | Endpoint |
 |---|---:|---|---|---|
@@ -68,10 +67,15 @@ unknown classifications are included only by `both`. Ask
 | Sepolia | `11155111` | ETH, 18 decimals | testnet | `https://ethereum-sepolia-rpc.publicnode.com` |
 | Hoodi | `560048` | ETH, 18 decimals | testnet | `https://ethereum-hoodi-rpc.publicnode.com` |
 
-`init_defaults` is idempotent — including across restarts — so it may be called
-unconditionally; `applied: false` is not an error. It writes over nothing: an endpoint,
+Call `init_defaults` unconditionally, at any time: it is idempotent — including across
+restarts — and `applied: false` is not an error. Do not gate it on `config_status()`
+(`{ ok, state, source, chains }`, `state` one of `unready`, `unconfigured`, `configured`),
+which is for display: a store holding only a chain 1 endpoint already reads `configured`
+yet lacks chain 1's name and the other chains. It writes over nothing: an endpoint,
 verified mode or proxy policy already stored is left alone, and a record's `source` moves
-one way only, `default` → `external`, as soon as any caller writes to it.
+one way only, `default` → `external`, as soon as any caller writes to it. A missing default
+chain is seeded at most once per device (`registry.json` records each one offered), so a
+chain removed with `remove_chain_config` stays removed.
 
 > **All three defaults are one operator.** publicnode sees the traffic of every
 > default-configured wallet. Set your own endpoint (or a SOCKS proxy) in `eth_rpc_ui` if

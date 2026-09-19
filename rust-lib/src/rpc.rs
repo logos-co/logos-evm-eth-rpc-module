@@ -6,7 +6,7 @@
 //! `proxy_required` and no usable proxy refuses to call rather than leaking in
 //! the clear. Pure (no Logos deps) and unit-testable with `cargo test`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -487,6 +487,15 @@ pub fn diff_chain(before: Option<&ChainConfig>, after: Option<&ChainConfig>) -> 
     }
 }
 
+/// `init_defaults`' reply for what [`EthRpc::init_defaults`] wrote. `applied` is true iff a
+/// chain was written; `[]` is a chain left as it was, present or removed since it was offered.
+pub fn defaults_reply(seeded: &[(u64, Vec<String>)]) -> Value {
+    let fields: serde_json::Map<String, Value> =
+        seeded.iter().map(|(id, written)| (id.to_string(), json!(written))).collect();
+    let applied = seeded.iter().any(|(_, written)| !written.is_empty());
+    json!({ "ok": true, "applied": applied, "seeded": fields })
+}
+
 /// The JSON-RPC method each typed helper issues. Named once so a caller can ask
 /// [`EthRpc::route_of`] about a helper without re-typing — and mistyping — the name.
 pub mod methods {
@@ -583,6 +592,9 @@ pub struct EthRpc {
     store_path: Option<PathBuf>,
     registry_path: Option<PathBuf>,
     scope: NetworkScope,
+    /// The [`DEFAULT_CHAINS`] ids `init_defaults` has offered on this device, persisted in
+    /// `registry.json`, so a default the user removed is not seeded again.
+    offered_defaults: BTreeSet<u64>,
     verified: Option<std::sync::Arc<dyn VerifiedRouter>>,
 }
 
@@ -593,6 +605,7 @@ impl EthRpc {
             store_path: None,
             registry_path: None,
             scope: NetworkScope::Mainnets,
+            offered_defaults: BTreeSet::new(),
             verified: None,
         }
     }
@@ -618,6 +631,10 @@ impl EthRpc {
                 _ => NetworkScope::Mainnets,
             };
         }
+        // Absent on a registry written before the record existed: nothing offered yet.
+        if let Some(ids) = value.get("offeredDefaults").and_then(Value::as_array) {
+            self.offered_defaults = ids.iter().filter_map(Value::as_u64).collect();
+        }
     }
 
     fn persist_registry(&self) {
@@ -625,10 +642,8 @@ impl EthRpc {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(
-            path,
-            serde_json::to_string_pretty(&json!({ "scope": self.scope })).unwrap_or_default(),
-        );
+        let registry = json!({ "scope": self.scope, "offeredDefaults": self.offered_defaults });
+        let _ = std::fs::write(path, serde_json::to_string_pretty(&registry).unwrap_or_default());
     }
 
     fn load(&mut self) {
@@ -718,19 +733,31 @@ impl EthRpc {
         seeded
     }
 
-    /// Seed every chain in [`DEFAULT_CHAINS`], per field and only where ABSENT. Idempotent:
-    /// a second call from any consumer finds each field present and writes nothing.
-    /// Returns what each chain actually gained, so a caller can tell seeding from a no-op.
+    /// Seed every chain in [`DEFAULT_CHAINS`], per field and only where ABSENT. A missing chain
+    /// is seeded at most once per device: one offered before and since removed stays removed,
+    /// while one present keeps gaining the fields it lacks. Idempotent: a second call from any
+    /// consumer writes nothing. Returns what each chain actually gained.
     pub fn init_defaults(&mut self) -> Vec<(u64, Vec<String>)> {
-        DEFAULT_CHAINS
+        let seeded: Vec<(u64, Vec<String>)> = DEFAULT_CHAINS
             .iter()
             .map(|chain| {
-                (
-                    chain.chain_id,
-                    self.ensure_chain_config(chain.chain_id, &ChainConfig::from_builtin(chain)),
-                )
+                let id = chain.chain_id;
+                let removed = self.offered_defaults.contains(&id) && !self.chains.contains_key(&id);
+                let written = if removed {
+                    Vec::new()
+                } else {
+                    self.ensure_chain_config(id, &ChainConfig::from_builtin(chain))
+                };
+                (id, written)
             })
-            .collect()
+            .collect();
+        // After the chains are on disk, so a crash cannot record an offer that never landed.
+        let offered = self.offered_defaults.len();
+        self.offered_defaults.extend(DEFAULT_CHAINS.iter().map(|chain| chain.chain_id));
+        if self.offered_defaults.len() != offered {
+            self.persist_registry();
+        }
+        seeded
     }
 
     pub fn network_scope(&self) -> NetworkScope {
@@ -1734,14 +1761,124 @@ mod verified_tests {
     }
 }
 
-/// The "ask, then initialize" convention: `config_status` reports, `init_defaults` seeds, and
-/// neither may lower a setting a user chose.
+/// The defaults convention: `config_status` reports, `init_defaults` seeds whenever a consumer
+/// asks, and neither may lower a setting a user chose.
 #[cfg(test)]
 mod defaults_tests {
     use super::*;
 
     fn seeded_map(v: Vec<(u64, Vec<String>)>) -> HashMap<u64, Vec<String>> {
         v.into_iter().collect()
+    }
+
+    /// What a consumer does on start: ask for the defaults, with no `config_status` gate.
+    fn a_consumer_starts(r: &mut EthRpc) -> Vec<(u64, Vec<String>)> {
+        r.init_defaults()
+    }
+
+    fn text(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// The Ethereum RPC app may set chain 1's endpoint before any consumer starts. The store then
+    /// reads `configured`, so only an ungated call gives chain 1 its identity and a scope.
+    #[test]
+    fn an_endpoint_set_before_any_consumer_still_gains_its_identity_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = EthRpc::with_store(dir.path().join("chains.json"));
+        assert!(r.patch_chain_endpoint(1, "https://mine.example"));
+
+        let seeded = seeded_map(a_consumer_starts(&mut r));
+        let got = r.get_chain_config(1).unwrap();
+        assert_eq!(got.name.as_deref(), Some("Ethereum"), "chain 1 gains its identity");
+        assert_eq!((got.native_symbol.as_deref(), got.native_decimals), (Some("ETH"), Some(18)));
+        assert_eq!(got.testnet, Some(false));
+        assert_eq!(got.endpoint, "https://mine.example", "the user's endpoint is kept");
+        assert_eq!(got.source, ConfigSource::External);
+        let listing = r.list_chain_configs();
+        assert_eq!(listing["scope"], json!("mainnets"));
+        assert_eq!(listing["chains"][0]["chainId"], json!(1));
+        assert_eq!(listing["chains"][0]["inScope"], json!(true), "and is back in `mainnets`");
+
+        assert_eq!(seeded[&1], vec!["name", "nativeSymbol", "nativeDecimals", "testnet"]);
+        assert_eq!(seeded[&11155111], vec!["*".to_string()], "the other defaults are seeded");
+        assert_eq!(seeded[&560048], vec!["*".to_string()]);
+    }
+
+    #[test]
+    fn a_default_the_user_removed_stays_removed() {
+        let mut r = EthRpc::new();
+        a_consumer_starts(&mut r);
+        assert!(r.remove_chain_config(560048));
+
+        for _ in 0..2 {
+            let again = a_consumer_starts(&mut r);
+            assert!(seeded_map(again.clone())[&560048].is_empty(), "seeded at most once per device");
+            assert_eq!(defaults_reply(&again)["applied"], json!(false));
+            assert!(r.get_chain_config(560048).is_none());
+        }
+        // Only a MISSING chain is declined: one the user brings back gains what it lacks.
+        assert!(r.patch_chain_endpoint(560048, "https://mine.example"));
+        assert_eq!(
+            seeded_map(a_consumer_starts(&mut r))[&560048],
+            vec!["name", "nativeSymbol", "nativeDecimals", "testnet"],
+        );
+    }
+
+    #[test]
+    fn a_second_call_writes_nothing_and_answers_applied_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let (chains, registry) = (dir.path().join("chains.json"), dir.path().join("registry.json"));
+        let mut r = EthRpc::with_store(chains.clone());
+        assert_eq!(defaults_reply(&a_consumer_starts(&mut r))["applied"], json!(true));
+
+        // Both files rewritten compactly: `persist` pretty-prints, so a write would show.
+        for p in [&chains, &registry] {
+            let v: Value = serde_json::from_str(&text(p)).unwrap();
+            std::fs::write(p, v.to_string()).unwrap();
+        }
+        let before = (text(&chains), text(&registry));
+        let reply = defaults_reply(&a_consumer_starts(&mut r));
+        assert_eq!((&reply["ok"], &reply["applied"]), (&json!(true), &json!(false)));
+        assert!(reply["seeded"].as_object().unwrap().values().all(|w| w == &json!([])));
+        assert_eq!((text(&chains), text(&registry)), before, "neither file was rewritten");
+    }
+
+    #[test]
+    fn the_offered_record_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chains.json");
+        {
+            let mut r = EthRpc::with_store(path.clone());
+            a_consumer_starts(&mut r);
+            assert!(r.remove_chain_config(11155111));
+        }
+        let mut r = EthRpc::with_store(path);
+        let again = seeded_map(a_consumer_starts(&mut r));
+        assert!(again[&11155111].is_empty(), "a restart does not offer it again");
+        assert!(again.values().all(|w| w.is_empty()));
+        assert!(r.get_chain_config(11155111).is_none());
+        let registry: Value = serde_json::from_str(&text(&dir.path().join("registry.json"))).unwrap();
+        assert_eq!(registry["offeredDefaults"], json!([1, 560048, 11155111]));
+    }
+
+    #[test]
+    fn a_registry_written_before_the_record_seeds_the_missing_defaults_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chains.json");
+        std::fs::write(dir.path().join("registry.json"), r#"{"scope":"both"}"#).unwrap();
+        std::fs::write(&path, r#"{"1":{"endpoint":"https://legacy"}}"#).unwrap();
+        {
+            let mut r = EthRpc::with_store(path.clone());
+            let first = seeded_map(a_consumer_starts(&mut r));
+            assert_eq!(first[&11155111], vec!["*".to_string()], "no record reads as nothing offered");
+            assert_eq!(first[&560048], vec!["*".to_string()]);
+            assert!(r.remove_chain_config(560048));
+        }
+        let mut r = EthRpc::with_store(path);
+        assert!(seeded_map(a_consumer_starts(&mut r))[&560048].is_empty(), "once, not once per process");
+        assert!(r.get_chain_config(560048).is_none());
+        assert_eq!(r.network_scope(), NetworkScope::Both, "recording an offer keeps the scope");
     }
 
     fn snapshot(r: &EthRpc) -> String {
