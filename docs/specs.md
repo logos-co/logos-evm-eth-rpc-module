@@ -39,20 +39,25 @@ RPC endpoints:
 
 ```mermaid
 flowchart TD
-    UI["logos-evm-wallet-ui<br/>(QtRO + QML app)"]
-    BE["logos-evm-wallet-backend-module<br/>(coordinator + tx builder, alloy)"]
-    KS["logos-evm-keystore-module"]
-    UNI["logos-evm-uniswap-module<br/>(concurrency: multi)"]
-    TL["logos-evm-token-list-module"]
+    WUI["logos-eth-wallet-ui"]
+    UUI["logos-uniswap-ui"]
+    EWB["eth_wallet_backend<br/>(logos-eth-wallet-backend)"]
+    UB["uniswap_backend<br/>(logos-uniswap-backend)"]
+    TX["tx_sender_module"]
+    FEE["fee_module"]
+    AS["evm_assets_module"]
+    UNI["uniswap_module<br/>(concurrency: multi)"]
     ETH["eth_rpc_module<br/>(THIS REPO — concurrency: multi)"]
     NP["logos-evm-net-proxy<br/>(fail-closed HTTP, inlined as src/proxy.rs)"]
     NODES["Public JSON-RPC endpoints<br/>(per chainId)"]
 
-    UI --> BE
-    BE --> KS
-    BE --> ETH
-    BE --> TL
-    BE --> UNI
+    WUI --> EWB
+    UUI --> UB
+    EWB --> ETH
+    UB --> ETH
+    TX --> ETH
+    FEE --> ETH
+    AS --> ETH
     UNI --> ETH
     ETH -. "vendored copy" .-> NP
     ETH --> NODES
@@ -61,9 +66,10 @@ flowchart TD
     class ETH this;
 ```
 
-`eth_rpc_module` is a **leaf** of the wallet's outbound network surface: it is driven by
-`wallet_backend_module` (which pushes chain config down into it and reads balances/gas
-through it) and by `uniswap_module` (which issues Multicall3 batches through it). It calls
+`eth_rpc_module` is a **leaf** of the wallet's outbound network surface. The two app
+backends, `eth_wallet_backend` and `uniswap_backend`, read and manage the chain registry
+through it; `tx_sender_module` prices, broadcasts and follows transactions; `fee_module`
+reads fees; `evm_assets_module` and `uniswap_module` issue Multicall3 batches. It calls
 **no other Logos module** — its only outbound dependency is the network, reached through
 the vendored net-proxy chokepoint.
 
@@ -162,7 +168,7 @@ flowchart TB
 
 `eth_rpc_module` has **no Logos-module dependencies**; its only "dependency" is the
 network, reached through the inlined net-proxy chokepoint. The representative flow below
-shows a caller (`wallet_backend_module` or `uniswap_module`, or the `logoscore` CLI)
+shows a caller (`tx_sender_module` or `evm_assets_module`, or the `logoscore` CLI)
 driving this module, and the module reaching a JSON-RPC node.
 
 ```mermaid
@@ -205,12 +211,21 @@ code in this repo (`glue.rs`) is unaware of that; it just returns the JSON strin
 
 ### How specific callers drive it
 
-- **`wallet_backend_module`** pushes chain config (`set_chain_config`) at startup, then
-  fans out per-chain `get_balance` / `verify_chain_id` and uses `gas_price`,
-  `fee_history`, `estimate_gas`, `get_transaction_count`, `send_raw_transaction`,
-  `get_transaction_receipt` across the send pipeline (build → sign → broadcast → record).
+- **`eth_wallet_backend`** and **`uniswap_backend`** ask for `init_defaults` on every
+  start, read the registry with `list_chain_configs` and relay `verified_proxy_status`.
+  Both subscribe to `chain_config_changed`, `chain_enabled_changed` and
+  `network_scope_changed`; the wallet's network settings write through
+  `set_chain_enabled` and `set_network_scope`.
+- **`tx_sender_module`** reads `get_balance` and `get_transaction_count` to price a send,
+  broadcasts it with `send_raw_transaction`, follows it with `get_transaction_receipt` and
+  `get_transaction_by_hash`, and reads block headers through `raw_rpc`
+  (`eth_getBlockByNumber`).
+- **`fee_module`** reads `fee_history` and `gas_price`, and prices calls with
+  `estimate_gas` and `raw_rpc` (`eth_estimateGas`, `eth_call`, `eth_maxPriorityFeePerGas`).
+- **`evm_assets_module`** reads chain metadata from `list_chain_configs` and balances as a
+  Multicall3 batch through `call`.
 - **`uniswap_module`** issues a single Multicall3 batch as an `eth_call` via this module's
-  `call(chainId, {to, data})` (and reads block/fee data) to price V2/V3/V4 pools.
+  `call(chainId, {to, data})` to price V2/V3/V4 pools.
 
 ---
 
@@ -694,8 +709,8 @@ Chain records live in `<instance_persistence_path>/chains.json`, written by
 
 ```json
 {
-  "1":  { "endpoint": "https://eth.example",  "proxy": null, "proxyRequired": false, "timeoutSecs": 30 },
-  "10": { "endpoint": "https://op.example",   "proxy": "socks5h://127.0.0.1:9050", "proxyRequired": true, "timeoutSecs": 30, "source": "external" }
+  "1":  { "endpoint": "https://eth.example",  "proxy": null, "proxyRequired": false, "timeoutSecs": 8 },
+  "10": { "endpoint": "https://op.example",   "proxy": "socks5h://127.0.0.1:9050", "proxyRequired": true, "timeoutSecs": 8, "source": "external" }
 }
 ```
 
