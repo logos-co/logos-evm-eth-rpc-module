@@ -33,6 +33,12 @@ fn default_verified_timeout() -> u64 {
     15
 }
 
+fn default_verified_max() -> u64 {
+    // For callers that bring their own, longer deadline. A verified eth_call fetches a proof
+    // per slot it touches: a mainnet Uniswap quote batch measured 18–29 s (2026-09-24).
+    45
+}
+
 /// The verified leg's per-call budget, from the chain's `verifiedTimeoutSecs`. Clamped because
 /// the value is user-supplied: 0 would time out instantly and an unbounded one never returns.
 fn verified_budget(secs: u64) -> Duration {
@@ -144,8 +150,13 @@ pub struct ChainConfig {
     /// hides who is asking, this one proves the answer.
     #[serde(default)]
     pub verified_proxy_mode: VerifiedProxyMode,
+    /// The verified budget of a caller that set no deadline: it is on the SDK's 20 s default.
     #[serde(default = "default_verified_timeout")]
     pub verified_timeout_secs: u64,
+    /// The most a caller's own deadline may get on the verified leg. A field of its own, not
+    /// a larger `verifiedTimeoutSecs`: every stored record already carries that one at 15.
+    #[serde(default = "default_verified_max")]
+    pub verified_max_secs: u64,
     /// Absent on a `chains.json` written before this field existed → `external`.
     #[serde(default)]
     pub source: ConfigSource,
@@ -239,6 +250,7 @@ impl ChainConfig {
             timeout_secs: default_timeout(),
             verified_proxy_mode: VerifiedProxyMode::Off,
             verified_timeout_secs: default_verified_timeout(),
+            verified_max_secs: default_verified_max(),
             source: ConfigSource::Builtin,
         }
     }
@@ -313,6 +325,8 @@ pub struct ChainConfigWire {
     pub verified_proxy_mode: Option<VerifiedProxyMode>,
     #[serde(default)]
     pub verified_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub verified_max_secs: Option<u64>,
 }
 
 impl ChainConfigWire {
@@ -341,6 +355,10 @@ impl ChainConfigWire {
                 .verified_timeout_secs
                 .or_else(|| existing.map(|c| c.verified_timeout_secs))
                 .unwrap_or_else(default_verified_timeout),
+            verified_max_secs: self
+                .verified_max_secs
+                .or_else(|| existing.map(|c| c.verified_max_secs))
+                .unwrap_or_else(default_verified_max),
             // Not resolved from the wire: a caller writing a record makes it theirs.
             source: ConfigSource::External,
         }
@@ -1016,8 +1034,12 @@ impl EthRpc {
                 .as_ref()
                 .ok_or_else(|| RpcError::VerifiedProxy("no verified proxy is wired up".into()))?;
             let coerced = verified_params(method, &params);
-            let configured = verified_budget(cfg.verified_timeout_secs);
-            let budget = deadline.map_or(configured, |d| d.min(configured));
+            // No deadline: the chain's budget. A deadline may run past it, up to the ceiling —
+            // never below the budget, so raising `verifiedTimeoutSecs` alone still counts.
+            let budget = match deadline {
+                None => verified_budget(cfg.verified_timeout_secs),
+                Some(d) => d.min(verified_budget(cfg.verified_max_secs.max(cfg.verified_timeout_secs))),
+            };
             if budget < MIN_BUDGET {
                 return Err(RpcError::Timeout {
                     budget_ms: budget.as_millis(),
@@ -1563,6 +1585,28 @@ mod verified_tests {
         assert!(r.patch_chain_transport(1, None, Some(25)));
         r.get_balance(1, "0xabc").unwrap();
         assert_eq!(spy.budget(), Some(Duration::from_secs(25)));
+    }
+
+    #[test]
+    fn a_caller_deadline_may_run_past_the_verified_budget_up_to_the_ceiling() {
+        let spy = SpyRouter::ok(json!("0x1"));
+        let mut r = EthRpc::new();
+        let c = ChainConfig { verified_timeout_secs: 15, verified_max_secs: 45, ..cfg(VerifiedProxyMode::Required) };
+        r.set_chain_config(1, c).unwrap();
+        r.set_verified_router(spy.clone());
+        let call = json!({ "to": "0x0000000000000000000000000000000000000001", "data": "0x" });
+
+        // No deadline: the caller is on the SDK's 20 s default, so it gets the 15 s budget.
+        r.call_within(1, call.clone(), None).unwrap();
+        assert_eq!(spy.budget(), Some(Duration::from_secs(15)));
+        // A 30 s deadline gets 30 s; one past the ceiling gets the ceiling.
+        r.call_within(1, call.clone(), Some(Duration::from_secs(30))).unwrap();
+        assert_eq!(spy.budget(), Some(Duration::from_secs(30)));
+        r.call_within(1, call.clone(), Some(Duration::from_secs(90))).unwrap();
+        assert_eq!(spy.budget(), Some(Duration::from_secs(45)));
+        // A record written before the field existed reads back with the 45 s ceiling.
+        let old: ChainConfig = serde_json::from_str(r#"{"endpoint":"https://x","verifiedTimeoutSecs":15}"#).unwrap();
+        assert_eq!(old.verified_max_secs, 45);
     }
 
     #[test]
