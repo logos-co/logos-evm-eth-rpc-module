@@ -257,8 +257,8 @@ Store (insert/replace) the configuration for a chain and persist it.
 - **`chain_id`** — EIP-155 chain id (e.g. `1` mainnet, `10` Optimism).
 - **`config_json`** — a JSON object matching `ChainConfig` (§6):
   `{ "endpoint": "...", "proxy"?: "...", "proxyRequired"?: bool, "timeoutSecs"?: u64,
-  "verifiedProxyMode"?: "off"|"required", "verifiedTimeoutSecs"?: u64 }`.
-- An **omitted** `verifiedProxyMode` / `verifiedTimeoutSecs` preserves what is stored; only an
+  "verifiedProxyMode"?: "off"|"required", "verifiedTimeoutSecs"?: u64, "verifiedMaxSecs"?: u64 }`.
+- An **omitted** `verifiedProxyMode` / `verifiedTimeoutSecs` / `verifiedMaxSecs` preserves what is stored; only an
   explicit `"off"` lowers the mode. `chains.json` is shared, and a sibling wallet that predates
   verified routing must not revoke a user's security setting by silence.
 - **Returns** `true` on success; `false` if `config_json` fails to parse **or** the
@@ -659,6 +659,8 @@ pub struct ChainConfig {
     pub verified_proxy_mode: VerifiedProxyMode,  // JSON: "verifiedProxyMode" — off | required
     #[serde(default = "default_verified_timeout")]
     pub verified_timeout_secs: u64,       // JSON: "verifiedTimeoutSecs" — default 15
+    #[serde(default = "default_verified_max")]
+    pub verified_max_secs: u64,           // JSON: "verifiedMaxSecs" — default 45
     #[serde(default)]
     pub source: ConfigSource,             // JSON: "source" — external | default (§5.6)
 }
@@ -671,7 +673,8 @@ pub struct ChainConfig {
 | `proxyRequired` | bool | `false` | If `true`, requests must traverse a proxy; with none usable the client fails closed. |
 | `timeoutSecs` | u64 | `8` | Per-request timeout. `0` leaves reqwest's default. |
 | `verifiedProxyMode` | `"off"` \| `"required"` | `"off"` | `required` routes through the light-client proxy and REFUSES rather than falling back (§5.2). Contradicts `proxyRequired`, which `validate()` rejects. |
-| `verifiedTimeoutSecs` | u64 | `15` | Budget for one call on the verified leg — a second hop, so more room than `timeoutSecs`. Read per call from this record and **clamped to 1..=60**: 0 would time out instantly, and an unbounded value never returns. |
+| `verifiedTimeoutSecs` | u64 | `15` | Budget for one call on the verified leg when the caller set **no deadline** — a second hop, so more room than `timeoutSecs`, but under the SDK's 20 s default that such a caller is on. Read per call from this record and **clamped to 1..=60**: 0 would time out instantly, and an unbounded value never returns. |
+| `verifiedMaxSecs` | u64 | `45` | The most a caller's **own deadline** (`call`'s `deadline_ms`) may get on the verified leg; the caller's deadline still bounds it. Never below `verifiedTimeoutSecs`, and clamped to 1..=60. A field of its own because every stored record already carries `verifiedTimeoutSecs` at 15; a record written before it existed reads back as 45. A verified `eth_call` fetches a proof per slot it touches: a mainnet Uniswap quote batch measured 18–29 s. |
 | `source` | `"external"` \| `"default"` | absent → `"external"` | Who wrote the record (§5.6). Reporting only, and **a caller cannot declare its own write to be a default**: `ChainConfigWire` omits the field, and the one path that parses a whole `ChainConfig` from caller JSON (`ensure_chain_config`) goes through `ChainConfig::from_caller_json`, which forces `external`. Absent on a pre-existing `chains.json` reads as `external` — a record already on disk was written by somebody. |
 
 > **camelCase is load-bearing.** The wallet backend emits `proxyRequired` / `timeoutSecs`.
