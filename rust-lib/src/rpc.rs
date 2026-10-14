@@ -382,6 +382,8 @@ pub enum RpcError {
     /// A read the verified route PROVES was asked for through an explicit url, which cannot
     /// prove anything. Refused rather than answered in the clear.
     VerifiedBypass(String),
+    /// A state override the verified proxy cannot take (status-im/nimbus-eth1#4986).
+    OverridesUnsupported(String),
 }
 
 impl std::fmt::Display for RpcError {
@@ -407,6 +409,10 @@ impl std::fmt::Display for RpcError {
                 "{m} is proof-backed on this chain's verified route: refused through an \
                  explicit url, which cannot prove it (use raw_rpc)"
             ),
+            RpcError::OverridesUnsupported(m) => write!(
+                f,
+                "{m} with a state override cannot be answered on this chain's verified route"
+            ),
             RpcError::Parse(e) => write!(f, "parse: {e}"),
         }
     }
@@ -427,6 +433,7 @@ impl RpcError {
             RpcError::VerifiedProxy(_) => "verified_proxy",
             RpcError::VerifiedBlocked { .. } => "verified_blocked",
             RpcError::VerifiedBypass(_) => "verified_bypass",
+            RpcError::OverridesUnsupported(_) => "overrides_unsupported",
         }
     }
 }
@@ -559,6 +566,12 @@ pub fn verified_params(method: &str, params: &Value) -> Value {
         _ => {}
     }
     Value::Array(p)
+}
+
+/// The proxy takes a bool where a node takes a state override, so an override would be lost.
+pub fn carries_state_override(method: &str, params: &Value) -> bool {
+    matches!(method, "eth_call" | "eth_estimateGas" | "eth_createAccessList")
+        && params.get(2).is_some_and(Value::is_object)
 }
 
 /// Normalise a verified-leg RESULT back to what a JSON-RPC node would have returned.
@@ -1033,6 +1046,9 @@ impl EthRpc {
                 .verified
                 .as_ref()
                 .ok_or_else(|| RpcError::VerifiedProxy("no verified proxy is wired up".into()))?;
+            if carries_state_override(method, &params) {
+                return Err(RpcError::OverridesUnsupported(method.to_string()));
+            }
             let coerced = verified_params(method, &params);
             // No deadline: the chain's budget. A deadline may run past it, up to the ceiling —
             // never below the budget, so raising `verifiedTimeoutSecs` alone still counts.
@@ -1268,6 +1284,7 @@ mod tests {
             RpcError::Parse("p".into()),
             RpcError::VerifiedProxy("v".into()),
             RpcError::VerifiedBypass("b".into()),
+            RpcError::OverridesUnsupported("o".into()),
         ] {
             assert!(!e.code().is_empty(), "{e} has no code");
             assert!(!e.code().contains(' '), "a code is a token, not prose: {}", e.code());
@@ -1493,6 +1510,24 @@ mod verified_tests {
         assert_eq!(p[2], json!(false));
         r.call(1, json!({ "to": "0xabc" })).unwrap();
         assert_eq!(spy.last().1.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_state_override_is_refused_on_the_verified_leg_without_asking_the_proxy() {
+        let spy = SpyRouter::ok(json!("0x5208"));
+        let r = verified_rpc(spy.clone());
+        let tx = json!({ "to": "0xabc" });
+        let diff = json!({ "0xdef": { "stateDiff": { "0x01": "0x02" } } });
+        for m in ["eth_call", "eth_estimateGas", "eth_createAccessList"] {
+            match r.rpc_call_routed(1, m, json!([tx, "latest", diff])) {
+                Err(e @ RpcError::OverridesUnsupported(_)) => assert_eq!(e.code(), "overrides_unsupported"),
+                other => panic!("{m}: expected a refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(spy.count(), 0);
+        r.rpc_call_routed(1, "eth_estimateGas", json!([tx, "latest"])).unwrap();
+        assert_eq!(spy.count(), 1, "without an override the call goes through as before");
+        assert!(!carries_state_override("eth_getBalance", &json!(["0xabc", "latest", {}])));
     }
 
     #[test]

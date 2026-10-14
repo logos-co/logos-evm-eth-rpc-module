@@ -692,6 +692,7 @@ pub struct ChainConfig {
 | `Parse(e)` | `parse: <detail>` (bad response shape / bad hex) |
 | `VerifiedProxy(e)` | `verified proxy: <e>` — the verified leg could not answer. Never downgraded to a direct call. |
 | `VerifiedBypass(m)` | `<m> is proof-backed on this chain's verified route: refused through an explicit url, which cannot prove it (use raw_rpc)` |
+| `OverridesUnsupported(m)` | `<m> with a state override cannot be answered on this chain's verified route` — code `overrides_unsupported`. `eth_call` / `eth_estimateGas` / `eth_createAccessList` with an override object as the third param; the proxy is never asked (status-im/nimbus-eth1#4986). |
 
 ### 6.3 `ProxyConfig` / `ProxyError` (`proxy.rs`)
 
