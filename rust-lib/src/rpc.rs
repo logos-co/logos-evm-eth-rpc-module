@@ -58,6 +58,11 @@ const MIN_BUDGET: Duration = Duration::from_millis(50);
 /// timeout as two independent timers — send-until-headers, then a fresh one for the body — and
 /// `post_rpc` does both. MEASURED: `ClientBuilder::timeout(1000ms)` against a node stalling
 /// 600ms on headers and 600ms on the body SUCCEEDS at 1.21s. `0` means reqwest's own 30s.
+/// The client-level timeout a chain's `timeoutSecs` sets, per phase. `0` is reqwest's own 30s.
+fn per_phase(timeout_secs: u64) -> Duration {
+    Duration::from_secs(if timeout_secs == 0 { 30 } else { timeout_secs })
+}
+
 fn configured_wall(timeout_secs: u64) -> Duration {
     let per_phase = if timeout_secs == 0 { 30 } else { timeout_secs };
     Duration::from_secs(per_phase.saturating_mul(2))
@@ -76,7 +81,8 @@ pub fn caller_deadline(ms: Option<i64>) -> Option<Duration> {
 /// timeout and a dropped socket all read `error sending request for url (...)` and nothing else.
 /// That is the whole message a caller gets, and it cannot be acted on. Walking `source()` appends
 /// the reason the OS actually gave.
-fn http_error(e: reqwest::Error, budget: Option<Duration>) -> RpcError {
+/// `budget` names the bound that expired: the caller's deadline, or the chain's own timeout.
+fn http_error(e: reqwest::Error, budget: Duration) -> RpcError {
     use std::error::Error;
     let mut s = e.to_string();
     let mut src = e.source();
@@ -87,9 +93,10 @@ fn http_error(e: reqwest::Error, budget: Option<Duration>) -> RpcError {
     // MEASURED: a HEADERS expiry reads "error sending request for url (...)" — word for word
     // what a REFUSED connection reads — and a BODY expiry reads "error decoding response
     // body", word for word what a malformed body reads. Only `is_timeout` tells them apart.
-    match (e.is_timeout(), budget) {
-        (true, Some(b)) => RpcError::Timeout { budget_ms: b.as_millis(), detail: s },
-        _ => RpcError::Http(s),
+    if e.is_timeout() {
+        RpcError::Timeout { budget_ms: budget.as_millis(), detail: s }
+    } else {
+        RpcError::Http(s)
     }
 }
 
@@ -1082,7 +1089,7 @@ impl EthRpc {
         let (client, endpoint) = self.client_for(chain_id)?;
         // `bound` is None on the untouched path, so the request carries no per-request timeout
         // and the client-level one governs exactly as it did before this parameter existed.
-        Self::post_rpc(&client, &endpoint, method, params, bound).map(|v| (v, None))
+        Self::post_rpc(&client, &endpoint, method, params, bound, per_phase(cfg.timeout_secs)).map(|v| (v, None))
     }
 
     /// Like [`Self::rpc_call`] but POSTs to an explicit `url` instead of the
@@ -1100,7 +1107,8 @@ impl EthRpc {
         }
         // Build the client from the chain's proxy config; ignore its endpoint.
         let (client, _endpoint) = self.client_for(chain_id)?;
-        Self::post_rpc(&client, url, method, params, None)
+        let timeout = self.chains.get(&chain_id).map_or(0, |c| c.timeout_secs);
+        Self::post_rpc(&client, url, method, params, None, per_phase(timeout))
     }
 
     /// POST a JSON-RPC request to `url` with `client` and unwrap the `result`.
@@ -1115,14 +1123,17 @@ impl EthRpc {
         method: &str,
         params: Value,
         budget: Option<Duration>,
+        configured: Duration,
     ) -> Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let mut req = client.post(url).json(&body);
         if let Some(b) = budget {
             req = req.timeout(b);
         }
-        let resp = req.send().map_err(|e| http_error(e, budget))?;
-        let v: Value = resp.json().map_err(|e| http_error(e, budget))?;
+        // An expiry is a timeout whichever bound fired: a slow endpoint is retried, a refusing one replaced.
+        let named = budget.unwrap_or(configured);
+        let resp = req.send().map_err(|e| http_error(e, named))?;
+        let v: Value = resp.json().map_err(|e| http_error(e, named))?;
         if let Some(err) = v.get("error") {
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
             let message = err.get("message").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1404,6 +1415,24 @@ mod tests {
         // what made an unreachable node undiagnosable from a CI log.
         let after_url = err.split_once(')').map(|(_, rest)| rest).unwrap_or("");
         assert!(after_url.contains(':'), "no cause chain in {err}");
+    }
+
+    /// The client-level expiry, with no caller deadline: before, it read `http`, word for word
+    /// like a refused connection, so no caller could tell a slow endpoint from a dead one.
+    #[test]
+    fn the_chains_own_timeout_expiring_is_a_timeout_too() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+        let mut r = EthRpc::new();
+        r.set_chain_config(1, ChainConfig { timeout_secs: 1, ..cfg(&format!("http://{addr}")) }).unwrap();
+        let e = r.block_number(1).unwrap_err();
+        assert_eq!(e.code(), "timeout", "{e}");
+        assert!(e.to_string().starts_with("no answer within 1000ms"), "{e}");
     }
 
     #[test]
