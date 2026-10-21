@@ -1,4 +1,4 @@
-name: "Running the eth-rpc Module Against logoscore"
+name: "Running the eth-rpc Module Against logosctl"
 output: eth-rpc-module-runtime.md
 release: ""
 
@@ -10,16 +10,16 @@ intro: |
   configured with `proxyRequired` and no usable proxy **refuses to send** rather
   than leaking in the clear.
 
-  This doc-test drives the module through a `logoscore` daemon against a **local
+  This doc-test drives the module through a `logosctl` daemon against a **local
   mock JSON-RPC node** (so it needs no external network and reproduces in CI):
 
-  1. Build/install the module and start a daemon.
+  1. Build the module, start a daemon and install the module into it.
   2. Configure a chain pointing at the mock node and read a balance — a real
      round-trip through the module's RPC transport.
   3. Configure a second chain that **requires a proxy** but has none, and watch
      the module refuse the request (the privacy guarantee).
 
-what_you_build: "This `eth_rpc_module`, packaged as `.lgx`, installed with `lgpm`, and driven through a `logoscore` daemon against a local mock node."
+what_you_build: "This `eth_rpc_module`, packaged as `.lgx`, installed into a `logosctl` session, and driven through its daemon against a local mock node."
 
 what_you_learn:
   - How per-chain config is stored in the module and addressed by chainId
@@ -37,15 +37,15 @@ prerequisites:
   - "**A Linux or macOS machine** with `python3` available (used to run the local mock JSON-RPC node)."
 
 sections:
-  - title: "Build logoscore and lgpm"
+  - title: "Build logosctl"
     step: true
     steps:
-      - title: "Build logoscore"
+      - title: "Build logosctl"
         text: |
           `eth_rpc_module` is `concurrency: "multi"`, so the daemon resolves its
           deferred replies on the caller's behalf — it must be built against
-          logos-protocol ≥ 0.2. logoscore-cli pins 0.8, so its own lock already
-          satisfies that and no `--override-input` is needed.
+          logos-protocol ≥ 0.2. logoscore-cli's own lock already satisfies that,
+          so no `--override-input` is needed.
 
           The overrides that used to be here moved logos-protocol and
           logos-liblogos/logos-protocol but not logos-plugin-qt's. An override
@@ -55,13 +55,10 @@ sections:
           88 -> 96 bytes, the pair disagreed and every getClient overran the heap:
           `free(): invalid next size` on glibc, silent on macOS. Completing the set
           instead trips logos-plugin-qt's own consumer-admission bound.
-        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
         code_block: |
-          nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
-        check_file: "logos/bin/logoscore"
-      - title: "Build lgpm"
-        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
-        check_file: "lgpm/bin/lgpm"
+          nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos
+        check_file: "logos/bin/logosctl"
 
   - title: "Build and install the eth-rpc module"
     step: true
@@ -72,17 +69,29 @@ sections:
           nix build 'github:logos-co/logos-evm-eth-rpc-module{release}#lgx' -o eth-rpc-lgx
         extra_run:
           run: "ls eth-rpc-lgx/*.lgx"
-      - title: "Seed the capability module"
-        run: |
-          mkdir -p modules
-          cp -RL ./logos/modules/. ./modules/
-        check_file: "modules/capability_module/manifest.json"
-      - title: "Install the .lgx with lgpm"
-        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file eth-rpc-lgx/*.lgx"
+      - title: "Start the daemon"
+        text: |
+          The session directory, `./session`, holds the daemon's config, its
+          installed modules and their data. `--detach` returns once the daemon
+          accepts commands.
+        # The bundled package downloader starts a storage node in $HOME; keep it
+        # out of the real one.
+        run: "mkdir -p home && HOME=\"$PWD/home\" ./logos/bin/logosctl --config-dir ./session daemon start --detach"
+        code_block: "logosctl daemon start --detach"
         expect_contains:
-          - "Installed to:"
+          - "Daemon started"
+      - title: "Install the .lgx"
+        text: |
+          A path ending in `.lgx` installs from disk, with no catalog involved. A
+          local build is unsigned, which the session's default policy accepts with
+          a warning. `-y` confirms, since there is no terminal to ask on.
+        run: "./logos/bin/logosctl --config-dir ./session install eth-rpc-lgx/*.lgx -y"
+        code_block: "logosctl install eth-rpc-lgx/*.lgx -y"
+        expect_contains:
+          - '"installed":["eth_rpc_module"]'
       - title: "Confirm the install"
-        run: "./lgpm/bin/lgpm --modules-dir ./modules list"
+        run: "./logos/bin/logosctl --config-dir ./session package ls"
+        code_block: "logosctl package ls"
         expect_contains:
           - "eth_rpc_module"
 
@@ -126,7 +135,7 @@ sections:
             print('listening on %s:%d after %.1fs' % (host, port, time.time() - t0), flush=True)
             srv.serve_forever()
       - title: "Start the mock node"
-        run: "sh -c 'python3 mock_node.py > mock.log 2>&1 &'"
+        run: "sh -c 'python3 mock_node.py > mock.log 2>&1 & echo $! > mock.pid'"
         code_block: "python3 mock_node.py &"
       - title: "Write the readiness check"
         file:
@@ -161,7 +170,7 @@ sections:
         expect_contains:
           - '"result": "0x1"'
 
-  - title: "Run the daemon and drive the client"
+  - title: "Drive the module"
     step: true
     steps:
       - title: "Write the chain configs"
@@ -177,39 +186,36 @@ sections:
           path: chain_fc.json
           content: |
             { "endpoint": "http://127.0.0.1:8599", "proxyRequired": true }
-      - title: "Start the daemon"
-        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
-        code_block: "logoscore -D -m ./modules > logs.txt &"
-      - run: "sleep 3"
       - title: "Load the module"
-        run: "./logos/bin/logoscore load-module eth_rpc_module"
+        run: "./logos/bin/logosctl --config-dir ./session module load eth_rpc_module"
+        code_block: "logosctl module load eth_rpc_module"
         expect_contains:
           - "eth_rpc_module"
       - title: "Configure chain 1 (mock node, no proxy)"
-        run: "./logos/bin/logoscore call eth_rpc_module set_chain_config 1 @chain_ok.json"
-        code_block: "logoscore call eth_rpc_module set_chain_config 1 @chain_ok.json"
+        run: "./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 1 @chain_ok.json"
+        code_block: "logosctl call eth_rpc_module set_chain_config 1 @chain_ok.json"
         expect_contains:
           - "true"
       - title: "List configured chains"
-        run: "./logos/bin/logoscore call eth_rpc_module list_chains"
+        run: "./logos/bin/logosctl --config-dir ./session call eth_rpc_module list_chains"
         expect_contains:
           - "chains"
       - title: "Seed registry metadata without replacing the endpoint"
-        run: "./logos/bin/logoscore call eth_rpc_module init_defaults"
+        run: "./logos/bin/logosctl --config-dir ./session call eth_rpc_module init_defaults"
         expect_contains:
           - "nativeSymbol"
       - title: "Disable and re-enable a chain"
         run: |
-          ./logos/bin/logoscore call eth_rpc_module set_chain_enabled 1 false
-          ./logos/bin/logoscore call eth_rpc_module set_chain_enabled 1 true
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_enabled 1 false
+          ./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_enabled 1 true
         expect_contains:
           - '\"enabled\":true'
       - title: "Select both mainnets and testnets"
-        run: "./logos/bin/logoscore call eth_rpc_module set_network_scope both"
+        run: "./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_network_scope both"
         expect_contains:
           - '\"scope\":\"both\"'
       - title: "Read the complete chain registry"
-        run: "./logos/bin/logoscore call eth_rpc_module list_chain_configs"
+        run: "./logos/bin/logosctl --config-dir ./session call eth_rpc_module list_chain_configs"
         expect_contains:
           - '\"name\":\"Ethereum\"'
           - '\"nativeSymbol\":\"ETH\"'
@@ -221,25 +227,25 @@ sections:
         # CI runners. verify_chain_id is a pure read, so retrying is safe.
         run: |
           for i in 1 2 3 4 5 6; do
-            out=$(./logos/bin/logoscore call eth_rpc_module verify_chain_id 1 2>&1)
+            out=$(./logos/bin/logosctl --config-dir ./session call eth_rpc_module verify_chain_id 1 2>&1)
             case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
           done
           printf '%s\n' "$out"
-        code_block: "logoscore call eth_rpc_module verify_chain_id 1"
+        code_block: "logosctl call eth_rpc_module verify_chain_id 1"
         expect_contains:
           - "chainId"
       - title: "Read a balance (round-trip)"
         run: |
           for i in 1 2 3 4 5 6; do
-            out=$(./logos/bin/logoscore call eth_rpc_module get_balance 1 f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1)
+            out=$(./logos/bin/logosctl --config-dir ./session call eth_rpc_module get_balance 1 f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1)
             case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
           done
           printf '%s\n' "$out"
-        code_block: "logoscore call eth_rpc_module get_balance 1 <address>"
+        code_block: "logosctl call eth_rpc_module get_balance 1 <address>"
         expect_contains:
           - "0x1234"
       - title: "Configure chain 9 (proxy REQUIRED, none available)"
-        run: "./logos/bin/logoscore call eth_rpc_module set_chain_config 9 @chain_fc.json"
+        run: "./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 9 @chain_fc.json"
         expect_contains:
           - "true"
       - title: "Fail-closed: the request is refused"
@@ -248,21 +254,20 @@ sections:
           to send the request in the clear — the wallet's privacy guarantee.
         run: |
           for i in 1 2 3 4 5 6; do
-            out=$(./logos/bin/logoscore call eth_rpc_module get_balance 9 f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1)
+            out=$(./logos/bin/logosctl --config-dir ./session call eth_rpc_module get_balance 9 f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1)
             case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
           done
           printf '%s\n' "$out"
-        code_block: "logoscore call eth_rpc_module get_balance 9 <address>"
+        code_block: "logosctl call eth_rpc_module get_balance 9 <address>"
         expect_contains:
           - "proxy required"
       - title: "Stop the daemon and the mock node"
         run: |
-          trap '' TERM
-          ./logos/bin/logoscore stop || true
-          pkill -f mock_node.py 2>/dev/null || true
-          true
-      - run: "sleep 2"
+          ./logos/bin/logosctl --config-dir ./session daemon stop || true
+          kill "$(cat mock.pid)" 2>/dev/null || true
+        code_block: "logosctl daemon stop"
       - title: "Confirm the daemon has stopped"
-        run: "./logos/bin/logoscore status || true"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
         expect_contains:
           - '"status":"not_running"'
