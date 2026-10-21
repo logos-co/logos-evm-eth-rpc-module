@@ -1,4 +1,4 @@
-# Running the eth-rpc Module Against logoscore
+# Running the eth-rpc Module Against logosctl
 
 `logos-evm-eth-rpc-module` is the **proxyable, fail-closed Ethereum JSON-RPC
 client** for the Logos multi-chain EVM wallet. It stores configuration per
@@ -7,16 +7,16 @@ outbound request is built through a single fail-closed chokepoint: a chain
 configured with `proxyRequired` and no usable proxy **refuses to send** rather
 than leaking in the clear.
 
-This doc-test drives the module through a `logoscore` daemon against a **local
+This doc-test drives the module through a `logosctl` daemon against a **local
 mock JSON-RPC node** (so it needs no external network and reproduces in CI):
 
-1. Build/install the module and start a daemon.
+1. Build the module, start a daemon and install the module into it.
 2. Configure a chain pointing at the mock node and read a balance — a real
    round-trip through the module's RPC transport.
 3. Configure a second chain that **requires a proxy** but has none, and watch
    the module refuse the request (the privacy guarantee).
 
-**What you'll build:** This `eth_rpc_module`, packaged as `.lgx`, installed with `lgpm`, and driven through a `logoscore` daemon against a local mock node.
+**What you'll build:** This `eth_rpc_module`, packaged as `.lgx`, installed into a `logosctl` session, and driven through its daemon against a local mock node.
 
 **What you'll learn:**
 
@@ -37,23 +37,26 @@ echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
 
 ---
 
-## Step 1: Build logoscore and lgpm
+## Step 1: Build logosctl
 
-### 1.1 Build logoscore
+### 1.1 Build logosctl
 
 `eth_rpc_module` is `concurrency: "multi"`, so the daemon resolves its
 deferred replies on the caller's behalf — it must be built against
-logos-protocol ≥ 0.2. The `--override-input` pins its protocol (and
-liblogos's) to the chain under test (master, where 0.2 lives).
+logos-protocol ≥ 0.2. logoscore-cli's own lock already satisfies that,
+so no `--override-input` is needed.
+
+The overrides that used to be here moved logos-protocol and
+logos-liblogos/logos-protocol but not logos-plugin-qt's. An override
+reaches only the input it names, and logos-qt-host bakes
+`sizeof(LogosAPIClient)` into its own `operator new` while logos-protocol
+defines the constructor -- so once protocol 4638634 grew that object
+88 -> 96 bytes, the pair disagreed and every getClient overran the heap:
+`free(): invalid next size` on glibc, silent on macOS. Completing the set
+instead trips logos-plugin-qt's own consumer-admission bound.
 
 ```bash
-nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
-```
-
-### 1.2 Build lgpm
-
-```bash
-nix build 'github:logos-co/logos-package-manager#cli' -o lgpm
+nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos
 ```
 
 ---
@@ -70,24 +73,30 @@ nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx' -o eth-rpc-lgx
 ls eth-rpc-lgx/*.lgx
 ```
 
-### 2.2 Seed the capability module
+### 2.2 Start the daemon
+
+The session directory, `./session`, holds the daemon's config, its
+installed modules and their data. `--detach` returns once the daemon
+accepts commands.
 
 ```bash
-mkdir -p modules
-cp -RL ./logos/modules/. ./modules/
-
+logosctl daemon start --detach
 ```
 
-### 2.3 Install the .lgx with lgpm
+### 2.3 Install the .lgx
+
+A path ending in `.lgx` installs from disk, with no catalog involved. A
+local build is unsigned, which the session's default policy accepts with
+a warning. `-y` confirms, since there is no terminal to ask on.
 
 ```bash
-./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file eth-rpc-lgx/*.lgx
+logosctl install eth-rpc-lgx/*.lgx -y
 ```
 
 ### 2.4 Confirm the install
 
 ```bash
-./lgpm/bin/lgpm --modules-dir ./modules list
+logosctl package ls
 ```
 
 ---
@@ -174,7 +183,7 @@ python3 wait_for_node.py
 
 ---
 
-## Step 4: Run the daemon and drive the client
+## Step 4: Drive the module
 
 ### 4.1 Write the chain configs
 
@@ -191,79 +200,87 @@ chain 9 **requires** a proxy but is given none — so it must fail closed.
 { "endpoint": "http://127.0.0.1:8599", "proxyRequired": true }
 ```
 
-### 4.3 Start the daemon
+### 4.3 Load the module
 
 ```bash
-logoscore -D -m ./modules > logs.txt &
+logosctl module load eth_rpc_module
 ```
+
+### 4.4 Configure chain 1 (mock node, no proxy)
 
 ```bash
-sleep 3
+logosctl call eth_rpc_module set_chain_config 1 @chain_ok.json
 ```
 
-### 4.4 Load the module
+### 4.5 List configured chains
 
 ```bash
-./logos/bin/logoscore load-module eth_rpc_module
+./logos/bin/logosctl --config-dir ./session call eth_rpc_module list_chains
 ```
 
-### 4.5 Configure chain 1 (mock node, no proxy)
+### 4.6 Seed registry metadata without replacing the endpoint
 
 ```bash
-logoscore call eth_rpc_module set_chain_config 1 @chain_ok.json
+./logos/bin/logosctl --config-dir ./session call eth_rpc_module init_defaults
 ```
 
-### 4.6 List configured chains
+### 4.7 Disable and re-enable a chain
 
 ```bash
-./logos/bin/logoscore call eth_rpc_module list_chains
+./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_enabled 1 false
+./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_enabled 1 true
+
 ```
 
-### 4.7 Verify the chain ID (real RPC round-trip)
+### 4.8 Select both mainnets and testnets
+
+```bash
+./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_network_scope both
+```
+
+### 4.9 Read the complete chain registry
+
+```bash
+./logos/bin/logosctl --config-dir ./session call eth_rpc_module list_chain_configs
+```
+
+### 4.10 Verify the chain ID (real RPC round-trip)
 
 `verify_chain_id` issues a live `eth_chainId` to the mock node.
 
 ```bash
-logoscore call eth_rpc_module verify_chain_id 1
+logosctl call eth_rpc_module verify_chain_id 1
 ```
 
-### 4.8 Read a balance (round-trip)
+### 4.11 Read a balance (round-trip)
 
 ```bash
-logoscore call eth_rpc_module get_balance 1 <address>
+logosctl call eth_rpc_module get_balance 1 <address>
 ```
 
-### 4.9 Configure chain 9 (proxy REQUIRED, none available)
+### 4.12 Configure chain 9 (proxy REQUIRED, none available)
 
 ```bash
-./logos/bin/logoscore call eth_rpc_module set_chain_config 9 @chain_fc.json
+./logos/bin/logosctl --config-dir ./session call eth_rpc_module set_chain_config 9 @chain_fc.json
 ```
 
-### 4.10 Fail-closed: the request is refused
+### 4.13 Fail-closed: the request is refused
 
 Chain 9 requires a proxy but none is configured, so the module refuses
 to send the request in the clear — the wallet's privacy guarantee.
 
 ```bash
-logoscore call eth_rpc_module get_balance 9 <address>
+logosctl call eth_rpc_module get_balance 9 <address>
 ```
 
-### 4.11 Stop the daemon and the mock node
+### 4.14 Stop the daemon and the mock node
 
 ```bash
-trap '' TERM
-./logos/bin/logoscore stop || true
-pkill -f mock_node.py 2>/dev/null || true
-true
-
+logosctl daemon stop
 ```
 
-```bash
-sleep 2
-```
-
-### 4.12 Confirm the daemon has stopped
+### 4.15 Confirm the daemon has stopped
 
 ```bash
-./logos/bin/logoscore status || true
+logosctl daemon status
 ```
