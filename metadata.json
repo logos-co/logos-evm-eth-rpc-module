@@ -1,6 +1,6 @@
 {
   "name": "eth_rpc_module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Proxyable, fail-closed Ethereum JSON-RPC client. Per-chain config (endpoint + proxy); RPC calls keyed by chainId. socks5h/Tor-ready.",
   "author": "Logos Core Team",
   "type": "core",
@@ -11,7 +11,7 @@
   "dependencies": [],
   "optional_dependencies": [
     "modules_state",
-    { "name": "verified_proxy_module", "version": "~0.1.0" }
+    { "name": "verified_proxy_module", "version": "~0.2.0" }
   ],
   "include": [],
   "capabilities": [],
